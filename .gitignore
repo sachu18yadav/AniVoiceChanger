@@ -1,0 +1,45 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# AI Models and Weights
+*.pth
+*.pt
+*.index
+*.npy
+*.onnx
+
+# Cache directories
+hubert_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Audio / Media files
+*.wav
+*.mp3
+*.flac
+*.ogg
+test_input.wav
+test_output.wav
+output.wav
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Large external cloned repositories
+voice-changer/
+Retrieval-based-Voice-Conversion-WebUI/
+RVC-Project/
