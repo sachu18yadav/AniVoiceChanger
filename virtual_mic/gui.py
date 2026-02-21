@@ -11,10 +11,14 @@ from utils import SystemChecker, SessionManager
 import pystray
 from PIL import Image, ImageDraw
 import numpy as np
+import collections
 try:
     from pynput import keyboard
 except ImportError:
     keyboard = None
+import requests
+import io
+import soundfile as sf
 
 # Configure look and feel
 ctk.set_appearance_mode("Dark")
@@ -126,23 +130,27 @@ class VoiceChangerApp(ctk.CTk):
 
         # Window Config
         self.title("CHARACTER VOICE PRO")
-        self.geometry("900x650")
-        self.configure(fg_color="#0F0F0F")
+        self.geometry("1000x700")
+        self.configure(fg_color="#0A0A0B")
         self.is_mini = False
-        self.last_geometry = "900x650"
+        self.last_geometry = "1000x700"
 
         # Engine & Session
         self.engine = WOkadaEngineClient()
         self.local_engine = VoiceChangerEngine(block_size=1024)
         self.session_data = SessionManager.load_session() or SessionManager.get_default_state()
         self.is_active = False
+        self.backend_mode = ctk.StringVar(value=self.session_data.get("backend_mode", "Local DSP"))
 
         # Per-voice pitch presets (semitones)
-        self.VOICE_PRESETS = {
+        self.DSP_PRESETS = {
             "standard_female": {"pitch": 12, "label": "Standard Anime Female"},
             "tsukiyomi":       {"pitch": 22, "label": "Tsukiyomi-chan (Extreme)"},
-            "chihiro":         {"pitch": 18, "label": "Chihiro Fujisaki"},
-            "foamy":           {"pitch": 15, "label": "Foamy the Squirrel"},
+        }
+        self.RVC_PRESETS = {
+            "chihiro": {"pitch": 18, "label": "Chihiro Fujisaki (AI)"},
+            "egirl":   {"pitch": 20, "label": "E-Girl (AI)"},
+            "foamy":   {"pitch": 15, "label": "Foamy the Squirrel (AI)"},
         }
 
         # Start checking w-okada status
@@ -157,54 +165,72 @@ class VoiceChangerApp(ctk.CTk):
         self.grid_rowconfigure(0, weight=1)
 
         # 1. Sidebar
-        self.sidebar = ctk.CTkFrame(self, width=200, corner_radius=0, fg_color="#161616")
+        self.sidebar = ctk.CTkFrame(self, width=220, corner_radius=0, fg_color="#121214", border_width=1, border_color="#1C1C1E")
         self.sidebar.grid(row=0, column=0, sticky="nsew")
         
-        self.logo_label = ctk.CTkLabel(self.sidebar, text="VOICE\nCHAMELEON", font=ctk.CTkFont(size=24, weight="bold"), text_color="#3B8ED0")
-        self.logo_label.pack(pady=30, padx=20)
+        self.logo_label = ctk.CTkLabel(self.sidebar, text="VOICE\nCHAMELEON", font=ctk.CTkFont(family="Segoe UI", size=22, weight="bold"), text_color="#FFFFFF")
+        self.logo_label.pack(pady=40, padx=32)
 
-        self.nav_btn_1 = ctk.CTkButton(self.sidebar, text="DASHBOARD", fg_color="#2B2B2B", hover_color="#3B8ED0")
-        self.nav_btn_1.pack(pady=10, padx=20, fill="x")
+        self.nav_btn_1 = ctk.CTkButton(self.sidebar, text="DASHBOARD", fg_color="#1C1C1E", hover_color="#2C2C2E", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"))
+        self.nav_btn_1.pack(pady=16, padx=32, fill="x")
 
-        self.nav_btn_2 = ctk.CTkButton(self.sidebar, text="AI MODELS", fg_color="transparent", text_color="gray", hover_color="#2B2B2B")
-        self.nav_btn_2.pack(pady=10, padx=20, fill="x")
+        self.nav_btn_2 = ctk.CTkButton(self.sidebar, text="AI MODELS", fg_color="transparent", text_color="#A0A0A0", hover_color="#1C1C1E", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"))
+        self.nav_btn_2.pack(pady=8, padx=32, fill="x")
         
-        self.sidebar_info = ctk.CTkLabel(self.sidebar, text="v2.0.4 PREMIUM", font=ctk.CTkFont(size=10), text_color="#404040")
-        self.sidebar_info.pack(side="bottom", pady=20)
+        # Backend Selector in Sidebar
+        ctk.CTkLabel(self.sidebar, text="PROCESSING ENGINE", font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"), text_color="#A0A0A0").pack(pady=(40, 8), padx=32, anchor="w")
+        self.backend_selector = ctk.CTkOptionMenu(self.sidebar, values=["Local DSP", "Local AI", "ElevenLabs API"], variable=self.backend_mode, command=self.on_backend_toggle, fg_color="#1C1C1E", button_color="#2C2C2E", button_hover_color="#3A3A3C", font=ctk.CTkFont(family="Segoe UI", size=12))
+        self.backend_selector.pack(pady=0, padx=32, fill="x")
+
+        self.sidebar_info = ctk.CTkLabel(self.sidebar, text="v2.0.4 PREMIUM", font=ctk.CTkFont(family="Segoe UI", size=10), text_color="#404040")
+        self.sidebar_info.pack(side="bottom", pady=32)
 
         # 2. Main Content
-        self.main_content = ctk.CTkFrame(self, corner_radius=20, fg_color="#1A1A1A")
-        self.main_content.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
+        self.main_content = ctk.CTkFrame(self, corner_radius=0, fg_color="#0A0A0B")
+        self.main_content.grid(row=0, column=1, sticky="nsew")
         
         # Header Area
         self.header_frame = ctk.CTkFrame(self.main_content, fg_color="transparent")
-        self.header_frame.pack(fill="x", padx=30, pady=(30, 10))
+        self.header_frame.pack(fill="x", padx=48, pady=(48, 16))
         
-        self.title_lbl = ctk.CTkLabel(self.header_frame, text="Active Modulation Center", font=ctk.CTkFont(size=18, weight="bold"))
+        self.title_lbl = ctk.CTkLabel(self.header_frame, text="Active Modulation Center", font=ctk.CTkFont(family="Segoe UI", size=24, weight="bold"), text_color="#FFFFFF")
         self.title_lbl.pack(side="left")
+
+        self.ptt_enabled = ctk.BooleanVar(value=self.session_data.get("ptt_enabled", False))
+        self.ptt_hotkey = self.session_data.get("ptt_hotkey", "<alt>")
         
-        self.status_indicator = ctk.CTkLabel(self.header_frame, text="● SERVER CHECKING", text_color="gray", font=ctk.CTkFont(size=12, weight="bold"))
-        self.status_indicator.pack(side="right", padx=10)
-
-        self.mini_toggle_btn = ctk.CTkButton(self.header_frame, text="MINI VIEW", width=80, height=24, fg_color="#333333", font=ctk.CTkFont(size=10), command=self.toggle_mini_mode)
+        self.ptt_check = ctk.CTkCheckBox(self.header_frame, text="Global PTT", variable=self.ptt_enabled, font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), fg_color="#007AFF", hover_color="#005BB5")
+        self.ptt_check.pack(side="left", padx=(32, 16))
+        
+        self.ptt_hotkey_btn = ctk.CTkButton(self.header_frame, text=f"Key: {self.ptt_hotkey}", width=80, height=28, corner_radius=6, fg_color="#1C1C1E", hover_color="#2C2C2E", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color="#FFFFFF", command=self.capture_hotkey)
+        self.ptt_hotkey_btn.pack(side="left")
+        
+        self.mini_toggle_btn = ctk.CTkButton(self.header_frame, text="MINI VIEW", width=80, height=28, corner_radius=6, fg_color="#1C1C1E", hover_color="#2C2C2E", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color="#A0A0A0", command=self.toggle_mini_mode)
         self.mini_toggle_btn.pack(side="right")
+        
+        self.status_indicator = ctk.CTkLabel(self.header_frame, text="● SERVER CHECKING", text_color="#A0A0A0", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"))
+        self.status_indicator.pack(side="right", padx=16)
 
-        # Visualizer
-        self.visualizer = WaveformVisualizer(self.main_content, height=100)
-        self.visualizer.pack(fill="x", padx=30, pady=10)
+        # Config Area (Dynamic)
+        self.config_container = ctk.CTkFrame(self.main_content, fg_color="transparent")
+        self.config_container.pack(fill="both", expand=True, padx=48, pady=16)
+        
+        # 1) ELEVENLABS FRAME
+        self.el_frame = ctk.CTkFrame(self.config_container, fg_color="#121214", corner_radius=12, border_width=1, border_color="#1C1C1E")
+        ctk.CTkLabel(self.el_frame, text="ELEVENLABS API ACTIVE", font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"), text_color="#FFFFFF").pack(pady=(48, 8))
+        ctk.CTkLabel(self.el_frame, text="Push-To-Talk is globally controlled from the top header.\nAudio will be synthetically rendered in the Cloud and broadcasted to the Virtual Cable.", text_color="#A0A0A0", font=ctk.CTkFont(family="Segoe UI", size=12)).pack(pady=16)
 
-        # Setup Split Frame
-        self.config_frame = ctk.CTkFrame(self.main_content, fg_color="transparent")
-        self.config_frame.pack(fill="both", expand=True, padx=30, pady=10)
-        self.config_frame.grid_columnconfigure((0,1), weight=1)
+        # 2) DSP / AI FRAME
+        self.dsp_ai_frame = ctk.CTkFrame(self.config_container, fg_color="transparent")
+        self.dsp_ai_frame.grid_columnconfigure((0,1), weight=1)
 
         # Left Column: Devices
-        self.left_col = ctk.CTkFrame(self.config_frame, fg_color="#242424", corner_radius=15, border_width=1, border_color="#303030")
-        self.left_col.grid(row=0, column=0, padx=(0, 10), sticky="nsew")
+        self.left_col = ctk.CTkFrame(self.dsp_ai_frame, fg_color="#121214", corner_radius=12, border_width=1, border_color="#1C1C1E")
+        self.left_col.grid(row=0, column=0, padx=(0, 16), sticky="nsew")
         
-        ctk.CTkLabel(self.left_col, text="AUDIO PIPELINE", font=ctk.CTkFont(size=11, weight="bold"), text_color="#3B8ED0").pack(pady=(15, 10), padx=20, anchor="w")
+        ctk.CTkLabel(self.left_col, text="AUDIO PIPELINE", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color="#A0A0A0").pack(pady=(24, 16), padx=32, anchor="w")
         
-        ctk.CTkLabel(self.left_col, text="Input Source", font=ctk.CTkFont(size=10)).pack(anchor="w", padx=20)
+        ctk.CTkLabel(self.left_col, text="Input Source", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color="#FFFFFF").pack(anchor="w", padx=32)
         
         # input device selector — auto-detect real mic (prefer Realtek, skip virtual cables)
         self.input_devices, _ = self.local_engine.get_devices()
@@ -217,74 +243,75 @@ class VoiceChangerApp(ctk.CTk):
                     break
         
         self.input_device_var = ctk.StringVar(value=default_input)
-        self.input_selector = ctk.CTkOptionMenu(self.left_col, values=self.input_devices, variable=self.input_device_var, command=self.on_device_change, font=ctk.CTkFont(size=10))
-        self.input_selector.pack(pady=(0, 10), padx=20, fill="x")
+        self.input_selector = ctk.CTkOptionMenu(self.left_col, values=self.input_devices, variable=self.input_device_var, command=self.on_device_change, font=ctk.CTkFont(family="Segoe UI", size=11), fg_color="#1C1C1E", button_color="#2C2C2E", button_hover_color="#3A3A3C")
+        self.input_selector.pack(pady=(8, 24), padx=32, fill="x")
         # Apply the auto-detected device immediately
         self.on_device_change(default_input)
 
-        ctk.CTkLabel(self.left_col, text="Routing Info", font=ctk.CTkFont(size=10)).pack(anchor="w", padx=20)
-        self.routing_info = ctk.CTkLabel(self.left_col, text="Configured in w-okada UI\nOutput: VB-Cable Input", justify="left", font=ctk.CTkFont(size=11), text_color="gray")
-        self.routing_info.pack(pady=(0, 15), padx=20, anchor="w")
+        ctk.CTkLabel(self.left_col, text="Routing Info", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color="#FFFFFF").pack(anchor="w", padx=32)
+        self.routing_info = ctk.CTkLabel(self.left_col, text="Output: VB-Cable Input", justify="left", font=ctk.CTkFont(family="Segoe UI", size=11), text_color="#A0A0A0")
+        self.routing_info.pack(pady=(8, 24), padx=32, anchor="w")
 
         # Right Column: Voice
-        self.right_col = ctk.CTkFrame(self.config_frame, fg_color="#242424", corner_radius=15, border_width=1, border_color="#303030")
-        self.right_col.grid(row=0, column=1, padx=(10, 0), sticky="nsew")
+        self.right_col = ctk.CTkFrame(self.dsp_ai_frame, fg_color="#121214", corner_radius=12, border_width=1, border_color="#1C1C1E")
+        self.right_col.grid(row=0, column=1, padx=(16, 0), sticky="nsew")
         
-        ctk.CTkLabel(self.right_col, text="VOICE PROFILE", font=ctk.CTkFont(size=11, weight="bold"), text_color="#3B8ED0").pack(pady=(15, 10), padx=20, anchor="w")
+        ctk.CTkLabel(self.right_col, text="VOICE PROFILE", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color="#A0A0A0").pack(pady=(24, 16), padx=32, anchor="w")
         
         self.profile_var = ctk.StringVar(value=self.session_data.get("last_mode", "standard_female"))
-        for key, info in self.VOICE_PRESETS.items():
-            rb = ctk.CTkRadioButton(self.right_col, text=info["label"], variable=self.profile_var, value=key, font=ctk.CTkFont(size=11), command=self.on_profile_change)
-            rb.pack(pady=8, padx=20, anchor="w")
+        self.radio_buttons = []
 
-        self.pitch_slider = ctk.CTkSlider(self.right_col, from_=-12, to=24, number_of_steps=36, fg_color="#1A1A1A", progress_color="#3B8ED0", command=self.on_slider_change)
+        self.radios_frame = ctk.CTkFrame(self.right_col, fg_color="transparent")
+        self.radios_frame.pack(fill="x", padx=32)
+
+        self.pitch_slider = ctk.CTkSlider(self.right_col, from_=-12, to=24, number_of_steps=36, fg_color="#1C1C1E", progress_color="#007AFF", button_color="#FFFFFF", button_hover_color="#E0E0E0", command=self.on_slider_change)
         self.pitch_slider.set(self.session_data.get("last_pitch", 12))
-        self.pitch_slider.pack(pady=(20, 5), padx=20, fill="x")
-        self.pitch_lbl = ctk.CTkLabel(self.right_col, text=f"Pitch Offset: {self.pitch_slider.get():.1f} ST", font=ctk.CTkFont(size=10))
-        self.pitch_lbl.pack(pady=(0, 15))
+        self.pitch_slider.pack(pady=(32, 8), padx=32, fill="x")
+        self.pitch_lbl = ctk.CTkLabel(self.right_col, text=f"Pitch Offset: {self.pitch_slider.get():.1f} ST", font=ctk.CTkFont(family="Segoe UI", size=11), text_color="#A0A0A0")
+        self.pitch_lbl.pack(pady=(0, 24))
 
         # --- TESTING LABORATORY (LAYER 1 & 2) ---
-        self.lab_frame = ctk.CTkFrame(self.main_content, fg_color="#242424", corner_radius=15, border_width=1, border_color="#303030")
-        self.lab_frame.pack(fill="x", padx=30, pady=10)
+        self.lab_frame = ctk.CTkFrame(self.main_content, fg_color="#121214", corner_radius=12, border_width=1, border_color="#1C1C1E")
+        self.lab_frame.pack(fill="x", padx=48, pady=16)
         
-        ctk.CTkLabel(self.lab_frame, text="TESTING LABORATORY", font=ctk.CTkFont(size=11, weight="bold"), text_color="#FFD700").pack(pady=(15, 5), padx=20, anchor="w")
+        ctk.CTkLabel(self.lab_frame, text="TESTING LABORATORY", font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"), text_color="#A0A0A0").pack(pady=(24, 8), padx=32, anchor="w")
         
         self.lab_btns = ctk.CTkFrame(self.lab_frame, fg_color="transparent")
-        self.lab_btns.pack(fill="x", padx=20, pady=(0, 15))
+        self.lab_btns.pack(fill="x", padx=32, pady=(0, 24))
         
-        self.open_wk_ui_btn = ctk.CTkButton(self.lab_btns, text="OPEN W-OKADA BROWSER UI", width=160, height=32, fg_color="#333333", font=ctk.CTkFont(size=10), command=lambda: webbrowser.open("http://127.0.0.1:18888"))
-        self.open_wk_ui_btn.pack(side="left", padx=5)
+        self.open_wk_ui_btn = ctk.CTkButton(self.lab_btns, text="OPEN BROWSER UI", width=160, height=36, corner_radius=6, fg_color="#1C1C1E", hover_color="#2C2C2E", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), command=lambda: webbrowser.open("http://127.0.0.1:18888"))
+        self.open_wk_ui_btn.pack(side="left", padx=8)
 
         # Record + Replay group
         self.rec_group = ctk.CTkFrame(self.lab_btns, fg_color="transparent")
-        self.rec_group.pack(side="left", padx=5)
+        self.rec_group.pack(side="left", padx=8)
         
-        self.local_rec_btn = ctk.CTkButton(self.rec_group, text="RECORD 5S TEST", width=120, height=32, fg_color="#552222", hover_color="#773333", font=ctk.CTkFont(size=10), command=self.toggle_local_record)
-        self.local_rec_btn.pack(side="left", padx=(0, 3))
+        self.local_rec_btn = ctk.CTkButton(self.rec_group, text="RECORD TEST", width=120, height=36, corner_radius=6, fg_color="#007AFF", hover_color="#005BB5", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), text_color="#FFFFFF", command=self.toggle_local_record)
+        self.local_rec_btn.pack(side="left", padx=(0, 8))
         
-        self.local_replay_btn = ctk.CTkButton(self.rec_group, text="▶ REPLAY", width=80, height=32, fg_color="#444444", hover_color="#555555", font=ctk.CTkFont(size=10), command=self.replay_local_test)
+        self.local_replay_btn = ctk.CTkButton(self.rec_group, text="▶ REPLAY", width=80, height=36, corner_radius=6, fg_color="#1C1C1E", hover_color="#2C2C2E", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), command=self.replay_local_test)
         # Hidden initially — pack it only after first recording
         
-        self.local_realtime_btn = ctk.CTkButton(self.lab_btns, text="LOCAL REALTIME OFF", width=140, height=32, fg_color="#225522", hover_color="#337733", font=ctk.CTkFont(size=10), command=self.toggle_local_realtime)
-        self.local_realtime_btn.pack(side="left", padx=5)
+        self.local_realtime_btn = ctk.CTkButton(self.lab_btns, text="LOCAL REALTIME OFF", width=140, height=36, corner_radius=6, fg_color="#1C1C1E", hover_color="#2C2C2E", font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"), command=self.toggle_local_realtime)
+        self.local_realtime_btn.pack(side="left", padx=8)
 
         # 3. Control Center (Bottom)
-        self.control_panel = ctk.CTkFrame(self.main_content, height=100, fg_color="#242424", corner_radius=15)
-        self.control_panel.pack(fill="x", padx=30, pady=20)
+        self.control_panel = ctk.CTkFrame(self.main_content, height=100, fg_color="transparent", corner_radius=0)
+        self.control_panel.pack(fill="x", padx=48, pady=32)
         
-        self.sync_btn = ctk.CTkButton(self.control_panel, text="SYNC SETTINGS", font=ctk.CTkFont(size=16, weight="bold"), width=180, height=50, corner_radius=12, fg_color="#2E7D32", hover_color="#388E3C", command=self.apply_profile)
-        self.sync_btn.pack(side="right", padx=25, pady=25)
+        self.sync_btn = ctk.CTkButton(self.control_panel, text="APPLY CONFIGURATION", font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"), width=220, height=48, corner_radius=12, fg_color="#007AFF", hover_color="#005BB5", text_color="#FFFFFF", command=self.apply_profile)
+        self.sync_btn.pack(side="right", padx=0, pady=0)
         
-        self.live_monitor_lbl = ctk.CTkLabel(self.control_panel, text="HOT SWAP READY", font=ctk.CTkFont(size=10), text_color="gray")
-        self.live_monitor_lbl.pack(side="right", padx=10)
+        self.live_monitor_lbl = ctk.CTkLabel(self.control_panel, text="HOT SWAP READY", font=ctk.CTkFont(family="Segoe UI", size=11), text_color="#A0A0A0")
+        self.live_monitor_lbl.pack(side="right", padx=24)
 
         # Performance Stats
         self.perf_frame = ctk.CTkFrame(self.main_content, fg_color="transparent")
-        self.perf_frame.pack(fill="x", padx=40, pady=(0, 20))
-        self.cpu_lbl = ctk.CTkLabel(self.perf_frame, text="CPU: 0%", font=ctk.CTkFont(size=10), text_color="#606060")
+        self.perf_frame.pack(fill="x", padx=48, pady=(0, 24))
+        self.cpu_lbl = ctk.CTkLabel(self.perf_frame, text="CPU: 0%", font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"), text_color="#606060")
         self.cpu_lbl.pack(side="left")
-        self.lat_lbl = ctk.CTkLabel(self.perf_frame, text="LATENCY: 0ms", font=ctk.CTkFont(size=10), text_color="#606060")
-        self.lat_lbl.pack(side="left", padx=30)
+        self.lat_lbl = ctk.CTkLabel(self.perf_frame, text="LATENCY: 0ms", font=ctk.CTkFont(family="Segoe UI", size=10, weight="bold"), text_color="#606060")
+        self.lat_lbl.pack(side="left", padx=32)
 
         # Last recorded audio for replay
         self.last_recorded_audio = None
@@ -297,10 +324,7 @@ class VoiceChangerApp(ctk.CTk):
         self.setup_tray()
         if keyboard: self.setup_hotkeys()
         
-        # Apply initial pitch to local engine from slider
-        initial_pitch = self.pitch_slider.get()
-        self.local_engine.semitones = initial_pitch
-        self.local_engine.anime_voice.pitch_shift = initial_pitch
+        self.on_backend_toggle(self.backend_mode.get())
 
     def _get_selected_input_device(self):
         """Get the currently selected input device ID."""
@@ -312,8 +336,40 @@ class VoiceChangerApp(ctk.CTk):
     def _get_effect(self):
         """Map selected profile to effect string."""
         prof = self.profile_var.get()
-        effect_map = {"tsukiyomi": "anime_girl", "chihiro": "anime_girl", "foamy": "anime_girl", "standard_female": "anime_girl"}
+        effect_map = {"tsukiyomi": "anime_girl", "standard_female": "anime_girl"}
         return effect_map.get(prof, "passthrough")
+
+    def rebuild_radio_buttons(self, backend_mode):
+        for rb in self.radio_buttons:
+            rb.destroy()
+        self.radio_buttons.clear()
+
+        presets = self.RVC_PRESETS if backend_mode == "Local AI" else self.DSP_PRESETS
+        
+        # Ensure selected profile exists in new dict, else default to first
+        if self.profile_var.get() not in presets:
+            self.profile_var.set(list(presets.keys())[0])
+
+        for key, info in presets.items():
+            rb = ctk.CTkRadioButton(self.radios_frame, text=info["label"], variable=self.profile_var, value=key, font=ctk.CTkFont(size=11), command=self.on_profile_change)
+            rb.pack(pady=8, anchor="w")
+            self.radio_buttons.append(rb)
+        
+        self.on_profile_change()
+
+    def on_backend_toggle(self, mode):
+        # Hide all first
+        self.dsp_ai_frame.pack_forget()
+        self.el_frame.pack_forget()
+        self.lab_frame.pack_forget()
+
+        if mode == "ElevenLabs API":
+            self.el_frame.pack(fill="both", expand=True)
+            self.lab_frame.pack(fill="x", padx=30, pady=10)
+        else:
+            self.dsp_ai_frame.pack(fill="both", expand=True)
+            self.rebuild_radio_buttons(mode)
+            self.lab_frame.pack(fill="x", padx=30, pady=10)
 
     def on_slider_change(self, val):
         self.pitch_lbl.configure(text=f"Pitch: {val:.0f} ST")
@@ -325,7 +381,9 @@ class VoiceChangerApp(ctk.CTk):
     def on_profile_change(self):
         """Auto-adjust pitch slider when profile changes."""
         profile_key = self.profile_var.get()
-        preset = self.VOICE_PRESETS.get(profile_key, {"pitch": 12})
+        backend = self.backend_mode.get()
+        presets = self.RVC_PRESETS if backend == "Local AI" else self.DSP_PRESETS
+        preset = presets.get(profile_key, {"pitch": 12})
         self.pitch_slider.set(preset["pitch"])
         self.on_slider_change(preset["pitch"])
         print(f"Profile: {profile_key} → pitch +{preset['pitch']} ST")
@@ -366,21 +424,55 @@ class VoiceChangerApp(ctk.CTk):
             if max_vol < 0.001:
                 print("WARNING: Recording is silent! Check your mic selection.")
             
-            self.after(0, lambda: self.local_rec_btn.configure(text="PROCESSING...", fg_color="#DD8800"))
+            self.after(0, lambda: self.local_rec_btn.configure(text="PROCESSING...", fg_color="#005BB5"))
             
-            # 2. Process with the CURRENT pitch from the slider
+            mode = self.backend_mode.get()
+            profile = self.profile_var.get()
             pitch = self.pitch_slider.get()
-            self.local_engine.semitones = pitch
-            self.local_engine.anime_voice.pitch_shift = pitch
             
-            block = recording.reshape(-1, 1)
-            final_audio = self.local_engine._process_block(block, "anime_girl").flatten()
-            
-            prof_name = self.VOICE_PRESETS.get(self.profile_var.get(), {}).get("label", "Unknown")
-            print(f"Processed as {prof_name} (+{pitch:.0f} ST). Playing back...")
+            if mode == "Local DSP":
+                self.local_engine.semitones = pitch
+                self.local_engine.anime_voice.pitch_shift = pitch
+                block = recording.reshape(-1, 1)
+                final_audio = self.local_engine._process_block(block, "anime_girl").flatten()
+                prof_name = self.DSP_PRESETS.get(profile, {}).get("label", profile)
+                print(f"DSP Processed as {prof_name} (+{pitch:.0f} ST). Playing back...")
+
+            elif mode == "Local AI":
+                # We dynamically route this to the AniVoiceChanger pipeline to prevent OOM
+                self.after(0, lambda: self.local_rec_btn.configure(text="AI INFERENCE...", fg_color="#8800DD"))
+                import sys, os
+                rvc_path = os.path.abspath('../AniVoiceChanger')
+                if rvc_path not in sys.path: sys.path.append(rvc_path)
+                import rvc_infer
+                
+                model_pth = os.path.join("models", profile, f"{profile}.pth")
+                if not os.path.exists(model_pth):
+                    model_pth = os.path.join("models", profile, "model.pth")
+                
+                model, info = rvc_infer.load_rvc_model(model_pth)
+                if model:
+                    index_path = os.path.join("models", profile, f"{profile}.index")
+                    idx, big_npy = rvc_infer.load_index(index_path) if os.path.exists(index_path) else (None, None)
+                    converted, out_sr = rvc_infer.infer(recording, sr, model, info, f0_up_key=pitch, index=idx, big_npy=big_npy)
+                    
+                    if out_sr != self.sample_rate:
+                        import librosa
+                        final_audio = librosa.resample(converted, orig_sr=out_sr, target_sr=self.sample_rate)
+                    else:
+                        final_audio = converted
+                        
+                    prof_name = self.RVC_PRESETS.get(profile, {}).get("label", profile)
+                    print(f"RVC Processed as {prof_name} (+{pitch:.0f} ST). Playing back...")
+                else:
+                    print("Failed to load RVC Model. Falling back to clean audio.")
+                    final_audio = recording
+            else:
+                final_audio = recording
+
             self.last_recorded_audio = final_audio
             
-            self.after(0, lambda: self.local_rec_btn.configure(text="PLAYING...", fg_color="#DD8800"))
+            self.after(0, lambda: self.local_rec_btn.configure(text="PLAYING...", fg_color="#005BB5"))
             
             # 3. Play to default speakers
             sd.play(final_audio, sr)
@@ -394,7 +486,7 @@ class VoiceChangerApp(ctk.CTk):
             self.after(0, self._finish_record_ui)
 
     def _finish_record_ui(self):
-        self.local_rec_btn.configure(text="RECORD NEW", fg_color="#552222")
+        self.local_rec_btn.configure(text="RECORD TEST", fg_color="#007AFF")
         self.local_record_active = False
         # Show replay button next to record button
         if not self.local_replay_btn.winfo_ismapped():
@@ -430,32 +522,17 @@ class VoiceChangerApp(ctk.CTk):
         pass
 
     def apply_profile(self):
-        profile_key = self.profile_var.get()
-        if profile_key == "tsukiyomi":
-            prof = TSUKIYOMI
-        elif profile_key == "chihiro":
-            prof = CHIHIRO
-        elif profile_key == "foamy":
-            prof = FOAMY
-        else:
-            prof = STANDARD_FEMALE
-            
-        prof.pitch_semitones = int(self.pitch_slider.get())
-        
-        # Also sync local engine
-        effect_map = {"tsukiyomi": "anime_girl", "chihiro": "anime_girl", "foamy": "anime_girl", "standard_female": "anime_girl"}
-        self.local_engine.switch_profile(effect_map.get(profile_key, "passthrough"))
-        self.local_engine.semitones = prof.pitch_semitones
-        self.local_engine.anime_voice.pitch_shift = prof.pitch_semitones
-        
-        if self.server_alive:
-            success = self.engine.switch_voice(prof)
-            if success:
-                self.sync_btn.configure(text="SYNCED ✓", fg_color="#1B5E20")
-                self.after(2000, lambda: self.sync_btn.configure(text="SYNC SETTINGS", fg_color="#2E7D32"))
-            else:
-                self.sync_btn.configure(text="SYNC FAILED", fg_color="#C62828")
-                self.after(2000, lambda: self.sync_btn.configure(text="SYNC SETTINGS", fg_color="#2E7D32"))
+        self.sync_btn.configure(text="SAVING...", fg_color="#005BB5")
+        state = {
+            "backend_mode": self.backend_mode.get(),
+            "last_mode": self.profile_var.get(),
+            "last_pitch": self.pitch_slider.get(),
+            "ptt_enabled": self.ptt_enabled.get(),
+            "ptt_hotkey": self.ptt_hotkey
+        }
+        SessionManager.save_session(state)
+        self.after(500, lambda: self.sync_btn.configure(text="SAVED ✓", fg_color="#005BB5"))
+        self.after(2000, lambda: self.sync_btn.configure(text="APPLY CONFIGURATION", fg_color="#007AFF"))
 
     def toggle_mini_mode(self):
         self.is_mini = not self.is_mini
@@ -463,8 +540,8 @@ class VoiceChangerApp(ctk.CTk):
             self.last_geometry = self.geometry()
             self.sidebar.grid_forget()
             self.header_frame.pack_forget()
-            self.visualizer.pack_forget()
-            self.config_frame.pack_forget()
+            self.visualizer.pack_forget() if hasattr(self, 'visualizer') else None
+            self.config_container.pack_forget()
             self.lab_frame.pack_forget()
             self.perf_frame.pack_forget()
             
@@ -479,7 +556,7 @@ class VoiceChangerApp(ctk.CTk):
             self.mini_logo = ctk.CTkLabel(self.mini_frame, text="CHAR VOICE MINI", font=ctk.CTkFont(size=14, weight="bold"), text_color="#3B8ED0")
             self.mini_logo.pack()
             
-            self.mini_profile = ctk.CTkOptionMenu(self.mini_frame, values=["standard_female", "tsukiyomi", "chihiro", "foamy"], variable=self.profile_var, width=150)
+            self.mini_profile = ctk.CTkLabel(self.mini_frame, text=f"Mode: {self.backend_mode.get()}", font=ctk.CTkFont(size=11))
             self.mini_profile.pack(pady=10)
             
             self.mini_restore = ctk.CTkButton(self.mini_frame, text="FULL VIEW", width=80, height=20, font=ctk.CTkFont(size=9), fg_color="#333333", command=self.toggle_mini_mode)
@@ -492,9 +569,10 @@ class VoiceChangerApp(ctk.CTk):
             self.main_content.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
             
             self.header_frame.pack(fill="x", padx=30, pady=(30, 10))
-            self.visualizer.pack(fill="x", padx=30, pady=10)
-            self.config_frame.pack(fill="both", expand=True, padx=30, pady=10)
-            self.lab_frame.pack(fill="x", padx=30, pady=10)
+            self.config_container.pack(fill="both", expand=True, padx=30, pady=5)
+            # Re-trigger routing since packs were forgotten
+            self.on_backend_toggle(self.backend_mode.get())
+            
             self.control_panel.pack(fill="x", padx=30, pady=20)
             self.perf_frame.pack(fill="x", padx=40, pady=(0, 20))
             self.geometry(self.last_geometry)
@@ -520,11 +598,7 @@ class VoiceChangerApp(ctk.CTk):
         self.after(5000, self.start_perf_loop)
 
     def on_closing(self):
-        state = {
-            "last_mode": self.profile_var.get(),
-            "last_pitch": self.pitch_slider.get()
-        }
-        SessionManager.save_session(state)
+        self.apply_profile()
         if self.icon: self.icon.stop()
         self.destroy()
     def setup_tray(self):
@@ -545,12 +619,171 @@ class VoiceChangerApp(ctk.CTk):
 
     def setup_hotkeys(self):
         def on_activate(): self.after(0, self.apply_profile)
+        
+        self.ptt_active = False
+        self.ptt_stream = None
+        self.ptt_chunks = []
+        self.capturing_hotkey = False
+        self.ptt_start_time = 0
+
+        def get_key_name(key):
+            try: return key.char
+            except AttributeError: return f"<{key.name}>"
+
+        def ptt_timeout_monitor():
+            while self.ptt_active:
+                if time.time() - self.ptt_start_time >= 10.0:
+                    self.after(0, self.stop_global_ptt)
+                    break
+                time.sleep(0.1)
+
+        def on_press(key):
+            if not key: return
+            kname = get_key_name(key)
+            if self.capturing_hotkey:
+                self.ptt_hotkey = kname
+                self.capturing_hotkey = False
+                self.after(0, lambda: self.ptt_hotkey_btn.configure(text=f"Key: {self.ptt_hotkey}"))
+                return
+            
+            if self.ptt_enabled.get() and kname == self.ptt_hotkey and not self.ptt_active:
+                self.ptt_active = True
+                self.ptt_chunks = []
+                self.ptt_start_time = time.time()
+                in_dev = self._get_selected_input_device()
+                try:
+                    import sounddevice as sd
+                    self.ptt_stream = sd.InputStream(samplerate=self.sample_rate, channels=1, device=in_dev, dtype='float32',
+                                                     callback=lambda indata, frames, time_info, status: self.ptt_chunks.append(indata.copy()))
+                    self.ptt_stream.start()
+                    self.after(0, lambda: self.status_indicator.configure(text="● RECORDING PTT", text_color="#FF3333"))
+                    threading.Thread(target=ptt_timeout_monitor, daemon=True).start()
+                except Exception as e:
+                    print(f"PTT Start Error: {e}")
+
+        def on_release(key):
+            if not key: return
+            kname = get_key_name(key)
+            if self.ptt_enabled.get() and kname == self.ptt_hotkey and self.ptt_active:
+                self.after(0, self.stop_global_ptt)
+
         def run_listener():
             try:
+                listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+                listener.start()
                 with keyboard.GlobalHotKeys({'<ctrl>+<shift>+t': on_activate}) as h:
                     h.join()
             except: pass
+            
         threading.Thread(target=run_listener, daemon=True).start()
+
+    def capture_hotkey(self):
+        self.capturing_hotkey = True
+        self.ptt_hotkey_btn.configure(text="Press any key...")
+
+    def stop_global_ptt(self):
+        if not self.ptt_active: return
+        self.ptt_active = False
+        if self.ptt_stream:
+            self.ptt_stream.stop()
+            self.ptt_stream.close()
+            self.ptt_stream = None
+        
+        if not self.ptt_chunks:
+            self.status_indicator.configure(text="● IDLE", text_color="gray")
+            return
+            
+        self.status_indicator.configure(text="● PROCESSING GLOBAL PTT...", text_color="#DD8800")
+        audio_data = np.concatenate(self.ptt_chunks, axis=0)
+        mode = self.backend_mode.get()
+        
+        if mode == "ElevenLabs API":
+            threading.Thread(target=self.process_elevenlabs_ptt, args=(audio_data,), daemon=True).start()
+        else:
+            threading.Thread(target=self.process_local_ptt, args=(audio_data, mode), daemon=True).start()
+            
+    def _broadcast_to_cable(self, audio_data, sr):
+        import sounddevice as sd
+        devices = sd.query_devices()
+        target_out_dev = sd.default.device[1] # fallback to speakers just in case
+        for i, dev in enumerate(devices):
+            name_lower = dev['name'].lower()
+            if dev['max_output_channels'] > 0 and 'cable input' in name_lower and 'vb-audio' in name_lower:
+                target_out_dev = i
+                break
+        sd.play(audio_data, sr, device=target_out_dev)
+        sd.wait()
+
+    def process_elevenlabs_ptt(self, audio_data):
+        import sounddevice as sd
+        wav_io = io.BytesIO()
+        sf.write(wav_io, audio_data, self.sample_rate, format='WAV', subtype='PCM_16')
+        wav_io.seek(0)
+        
+        api_key = "sk_cf8e0e9100def3309702b6d55050aca7366a56038b150a86"
+        voice_id = "uCNfGgx20cVUPpqSApMp"
+        url = f"https://api.elevenlabs.io/v1/speech-to-speech/{voice_id}"
+        headers = {"xi-api-key": api_key}
+        data = {"model_id": "eleven_multilingual_sts_v2", "voice_settings": '{"stability": 0.7, "similarity_boost": 0.75}'}
+        files = {"audio": ("audio.wav", wav_io, "audio/wav")}
+        
+        try:
+            resp = requests.post(url, headers=headers, data=data, files=files)
+            if resp.status_code == 200:
+                self.after(0, lambda: self.status_indicator.configure(text="● BROADCASTING CLOUD AUDIO", text_color="#33FF33"))
+                out_io = io.BytesIO(resp.content)
+                out_data, out_sr = sf.read(out_io)
+                self._broadcast_to_cable(out_data, out_sr)
+            else:
+                self.after(0, lambda: self.status_indicator.configure(text=f"● API ERR {resp.status_code}", text_color="red"))
+        except:
+            self.after(0, lambda: self.status_indicator.configure(text="● CLOUD PTT FAILED", text_color="red"))
+        finally:
+            self.after(0, lambda: self.status_indicator.configure(text="● SERVER ONLINE" if self.server_alive else "● LOCAL MODE", text_color="#4CAF50" if self.server_alive else "#3B8ED0"))
+
+    def process_local_ptt(self, recording, mode):
+        try:
+            recording = recording.flatten()
+            profile = self.profile_var.get()
+            pitch = self.pitch_slider.get()
+            sr = self.sample_rate
+            
+            if mode == "Local DSP":
+                self.local_engine.semitones = pitch
+                self.local_engine.anime_voice.pitch_shift = pitch
+                block = recording.reshape(-1, 1)
+                final_audio = self.local_engine._process_block(block, "anime_girl").flatten()
+            elif mode == "Local AI":
+                import sys, os
+                rvc_path = os.path.abspath('../AniVoiceChanger')
+                if rvc_path not in sys.path: sys.path.append(rvc_path)
+                import rvc_infer
+                
+                model_pth = os.path.join("models", profile, f"{profile}.pth")
+                if not os.path.exists(model_pth):
+                    model_pth = os.path.join("models", profile, "model.pth")
+                
+                model, info = rvc_infer.load_rvc_model(model_pth)
+                if model:
+                    index_path = os.path.join("models", profile, f"{profile}.index")
+                    idx, big_npy = rvc_infer.load_index(index_path) if os.path.exists(index_path) else (None, None)
+                    converted, out_sr = rvc_infer.infer(recording, sr, model, info, f0_up_key=pitch, index=idx, big_npy=big_npy)
+                    
+                    if out_sr != self.sample_rate:
+                        import librosa
+                        final_audio = librosa.resample(converted, orig_sr=out_sr, target_sr=self.sample_rate)
+                    else:
+                        final_audio = converted
+                else:
+                    final_audio = recording
+            
+            self.after(0, lambda: self.status_indicator.configure(text="● BROADCASTING LOCAL AUDIO", text_color="#33FF33"))
+            self._broadcast_to_cable(final_audio, sr)
+        except Exception as e:
+            print(f"Local PTT Error: {e}")
+        finally:
+            self.after(0, lambda: self.status_indicator.configure(text="● SERVER ONLINE" if self.server_alive else "● LOCAL MODE", text_color="#4CAF50" if self.server_alive else "#3B8ED0"))
+
 if __name__ == "__main__":
     app = VoiceChangerApp()
     app.protocol("WM_DELETE_WINDOW", app.on_closing)

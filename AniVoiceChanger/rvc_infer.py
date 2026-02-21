@@ -180,7 +180,7 @@ def load_rvc_model(model_path):
 # Full Inference Pipeline
 # ═══════════════════════════════════════════════════════════
 
-def infer(audio_np, sr, model, model_info, f0_up_key=0, index=None, big_npy=None, index_rate=0.75):
+def infer(audio_np, sr, model, model_info, f0_up_key=0, index=None, big_npy=None, index_rate=0.4, rms_mix_rate=0.8):
     t0 = time()
     tgt_sr = model_info["tgt_sr"]
     version = model_info["version"]
@@ -228,10 +228,45 @@ def infer(audio_np, sr, model, model_info, f0_up_key=0, index=None, big_npy=None
             audio_out = model.infer(feats, phone_lengths, sid)[0][0, 0]
     t3 = time()
 
-    # Trim and normalize
+    # Evaluate raw output
     result = audio_out.data.cpu().float().numpy()
+
+    # RMS ENVELOPE MATCHING (Fixes robotic unclear noises during silence/consonants)
+    if rms_mix_rate > 0:
+        # Resample padded input to target sr for accurate envelope calculation
+        audio_padded_tgt = librosa.resample(audio_padded, orig_sr=SR, target_sr=tgt_sr)
+        
+        # Match lengths in case of rounding
+        min_len = min(len(audio_padded_tgt), len(result))
+        audio_padded_tgt = audio_padded_tgt[:min_len]
+        result = result[:min_len]
+
+        # Calculate RMS using small windows (e.g. 5ms)
+        win_len = tgt_sr // 200
+        rms_in = librosa.feature.rms(y=audio_padded_tgt, frame_length=win_len*2, hop_length=win_len)[0]
+        rms_out = librosa.feature.rms(y=result, frame_length=win_len*2, hop_length=win_len)[0]
+        
+        # Interpolate RMS curves up to full sample length
+        rms_in_interp = np.interp(np.arange(len(result)), np.linspace(0, len(result), len(rms_in)), rms_in)
+        rms_out_interp = np.interp(np.arange(len(result)), np.linspace(0, len(result), len(rms_out)), rms_out)
+        
+        rms_out_interp = np.maximum(rms_out_interp, 1e-6) # Prevent div by zero
+        
+        # Calculate dynamic scaling ratio based on original envelope
+        ratio = rms_in_interp / rms_out_interp
+        
+        # Smooth the ratio to avoid distortion clicks
+        from scipy.ndimage import gaussian_filter1d
+        ratio = gaussian_filter1d(ratio, sigma=tgt_sr//200)
+        
+        # Mix the normalized envelope with the raw output
+        result_rms = result * ratio
+        result = result_rms * rms_mix_rate + result * (1 - rms_mix_rate)
+
+    # Trim padding and audio scaling
     if t_pad_tgt > 0 and len(result) > t_pad_tgt * 2:
         result = result[t_pad_tgt:-t_pad_tgt]
+        
     audio_max = np.abs(result).max() / 0.99
     if audio_max > 1: result = result / audio_max
 

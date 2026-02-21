@@ -17,6 +17,7 @@ from time import sleep, time
 import keyboard
 import numpy as np
 import sounddevice as sd
+import librosa
 from dotenv import load_dotenv
 
 # ── Config ──────────────────────────────────────────────────

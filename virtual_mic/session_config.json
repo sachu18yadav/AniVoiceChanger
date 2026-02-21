@@ -1,4 +1,7 @@
 {
+    "backend_mode": "Local AI",
     "last_mode": "foamy",
-    "last_pitch": 4.0
+    "last_pitch": 15.0,
+    "ptt_enabled": true,
+    "ptt_hotkey": "<alt>"
 }

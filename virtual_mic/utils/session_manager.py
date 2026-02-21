@@ -39,5 +39,9 @@ class SessionManager:
             "advanced_expanded": False,
             "latency_preset": "Balanced",
             "use_noise_gate": False,
-            "use_echo": False
+            "use_echo": False,
+            "elevenlabs_enabled": False,
+            "elevenlabs_api_key": "sk_cf8e0e9100def3309702b6d55050aca7366a56038b150a86",
+            "elevenlabs_voice_id": "uCNfGgx20cVUPpqSApMp",
+            "elevenlabs_hotkey": "<alt>"
         }
