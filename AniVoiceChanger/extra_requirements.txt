@@ -1,0 +1,7 @@
+sounddevice
+soundfile
+keyboard
+python-dotenv
+numpy
+pedalboard
+scipy

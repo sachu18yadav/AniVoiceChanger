@@ -1,0 +1,3 @@
+﻿MISMATCH layer_norm.bias: ckpt=[512] model=[768]
+MISMATCH layer_norm.weight: ckpt=[512] model=[768]
+MISSING from ckpt: feature_extractor.conv_layers.0.0.bias
