@@ -18,9 +18,11 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 is_half = device == "cuda"  # Use half precision on GPU for massive speed boost
 
 if device == "cpu":
-    # Limit CPU threads for gaming friendliness
-    torch.set_num_threads(2)
-    torch.set_num_interop_threads(2)
+    # Balanced CPU threads for better performance (2 was too slow for realtime AI testing)
+    import multiprocessing
+    cores = max(2, min(6, multiprocessing.cpu_count() - 2))
+    torch.set_num_threads(cores)
+    torch.set_num_interop_threads(cores)
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "virtual_mic" / "models"
 HUBERT_CACHE = Path(__file__).resolve().parent / "hubert_cache"

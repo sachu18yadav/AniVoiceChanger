@@ -68,7 +68,8 @@ class RVCVoiceConverter:
                 self.info, 
                 f0_up_key=self.pitch, 
                 index=self.index, 
-                big_npy=self.big_npy
+                big_npy=self.big_npy,
+                rms_mix_rate=0.0  # Bypass heavy CPU processing for latency
             )
             
             if out_sr != self.sample_rate:
