@@ -189,9 +189,6 @@ class AppRouter(ctk.CTk):
                     if not os.path.exists(model_pth):
                         pths = [f for f in os.listdir(model_dir) if f.endswith(".pth") and not f.startswith("D_") and not f.startswith("G_")]
                         if pths: model_pth = os.path.join(model_dir, pths[0])
-                        else:
-                            fallbacks = [f for f in os.listdir(model_dir) if f.endswith(".pth") and not f.startswith("D_")]
-                            if fallbacks: model_pth = os.path.join(model_dir, fallbacks[0])
                     
                     self.local_engine.ai_converter = rvc_wrapper.RVCVoiceConverter(model_pth, sample_rate=48000)
                     self.local_engine.ai_converter.pitch = self.app_state.pitch
@@ -269,9 +266,6 @@ class AppRouter(ctk.CTk):
                     if not os.path.exists(model_pth):
                         pths = [f for f in os.listdir(model_dir) if f.endswith(".pth") and not f.startswith("D_") and not f.startswith("G_")]
                         if pths: model_pth = os.path.join(model_dir, pths[0])
-                        else:
-                            fallbacks = [f for f in os.listdir(model_dir) if f.endswith(".pth") and not f.startswith("D_")]
-                            if fallbacks: model_pth = os.path.join(model_dir, fallbacks[0])
                     
                     converter = rvc_wrapper.RVCVoiceConverter(model_pth, sample_rate=48000)
                     converter.pitch = self.app_state.pitch

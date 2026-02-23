@@ -30,6 +30,10 @@ class RVCVoiceConverter:
             import rvc_infer
             self.model, self.info = rvc_infer.load_rvc_model(model_path)
             
+            if self.model is None:
+                print(f"Warning: RVC Wrapper failed to load {model_path}. File may be missing or uncompiled.")
+                return
+            
             # Auto-detect nearby index file if it exists
             model_dir = os.path.dirname(model_path)
             idxs = [f for f in os.listdir(model_dir) if f.endswith(".index")]
