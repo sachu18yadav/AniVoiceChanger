@@ -1,7 +1,7 @@
 import numpy as np
 
 class StreamBuffer:
-    def __init__(self, target_size=4096):
+    def __init__(self, target_size=6144): # ~128ms of audio at 48k for ultra-fast latency
         self.target_size = target_size
         self.buffer = np.array([], dtype=np.float32)
 

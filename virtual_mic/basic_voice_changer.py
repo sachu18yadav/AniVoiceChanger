@@ -33,10 +33,46 @@ class BasicVoiceChanger:
         self.record_queue = []
         self.sample_rate = 48000
         self.mic_stream = None
+        self.passthrough_stream = None
+        self.passthrough_active = False
         
         self.cable_out = find_cable_device()
         self.speaker_out = sd.default.device[1]
+        self.in_dev = INPUT_DEVICE if INPUT_DEVICE is not None else sd.default.device[0]
+
+        self.start_passthrough()
+
         
+    def start_passthrough(self):
+        if not self.cable_out or self.passthrough_active:
+            return
+        
+        def _passthrough_callback(indata, outdata, frames, time, status):
+            if status:
+                print(f"Passthrough status: {status}")
+            outdata[:] = indata
+
+        try:
+            self.passthrough_stream = sd.Stream(
+                device=(self.in_dev, self.cable_out),
+                samplerate=self.sample_rate,
+                channels=1,
+                callback=_passthrough_callback
+            )
+            self.passthrough_stream.start()
+            self.passthrough_active = True
+            print("[INFO] Background passthrough active (Normal Mic -> CABLE)")
+        except Exception as e:
+            print(f"Failed to start passthrough: {e}")
+
+    def stop_passthrough(self):
+        if self.passthrough_active and self.passthrough_stream:
+            self.passthrough_stream.stop()
+            self.passthrough_stream.close()
+            self.passthrough_stream = None
+            self.passthrough_active = False
+            print("[INFO] Background passthrough suspended")
+
     def _mic_callback(self, indata, frames, time, status):
         if status:
             print(status, flush=True)
@@ -44,13 +80,15 @@ class BasicVoiceChanger:
 
     def on_press(self, event):
         if not self.is_recording:
+            # Suspend passthrough before opening exclusive recording stream
+            self.stop_passthrough()
+            
             print(f"\n[RECORDING] Started. Speak now! (Holding '{RECORD_KEY}')")
             self.is_recording = True
             self.record_queue = []
             
             # Start mic stream
-            in_dev = INPUT_DEVICE if INPUT_DEVICE is not None else sd.default.device[0]
-            self.mic_stream = sd.InputStream(samplerate=self.sample_rate, channels=1, callback=self._mic_callback, device=in_dev)
+            self.mic_stream = sd.InputStream(samplerate=self.sample_rate, channels=1, callback=self._mic_callback, device=self.in_dev)
             self.mic_stream.start()
 
     def on_release(self, event):
@@ -85,6 +123,9 @@ class BasicVoiceChanger:
             
             # Playback
             self.play_audio(final_audio)
+            
+            # Resume normal mic passthrough
+            self.start_passthrough()
 
     def play_audio(self, audio_data):
         def _play(device_id, name):

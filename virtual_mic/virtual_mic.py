@@ -97,11 +97,23 @@ class VoiceChangerEngine:
             processed = pitch_shift(processed, self.semitones, self.sample_rate)
         elif effect == "ai":
             if self.ai_converter:
+                # Add current small block (e.g. 512 samples) to the sliding window
                 frame = self.ai_buffer.add(processed)
                 if frame is not None:
+                    # When buffer fills (e.g. 12288 samples), run full AI inference
                     ai_output = self.ai_converter.convert(frame)
-                    processed = ai_output.reshape(-1, 1)
+                    
+                    # Store the fresh large block of AI output
+                    if not hasattr(self, 'ai_out_queue'): self.ai_out_queue = []
+                    self.ai_out_queue.extend(ai_output.flatten().tolist())
+                
+                # Pop the exact number of samples we need right now to keep the physical stream moving
+                if hasattr(self, 'ai_out_queue') and len(self.ai_out_queue) >= len(processed):
+                    chunk = self.ai_out_queue[:len(processed)]
+                    self.ai_out_queue = self.ai_out_queue[len(processed):]
+                    processed = np.array(chunk).reshape(-1, 1)
                 else:
+                    # If AI hasn't produced its first chunk yet, output silence
                     processed = np.zeros_like(processed)
             else:
                 # Fallback to Anime Girl DSP if AI not loaded but selected
@@ -261,135 +273,7 @@ class VoiceChangerEngine:
         except:
             return [], []
 
-    def run_test(self, duration=5.0, effect_mode=None, callback: Optional[Callable] = None):
-        """Record, process in blocks, and playback to default output."""
-        if effect_mode:
-            self.current_effect = effect_mode
-        def _test_thread():
-            if sd is None: return
-            
-            try:
-                # 1. Record
-                # Prioritize self.input_device if set, otherwise use default
-                in_dev = self.input_device if self.input_device is not None else sd.default.device[0]
-                print(f"Recording {duration}s test from device {in_dev}...")
-                
-                recording = []
-                def _rec_callback(indata, frames, time, status):
-                    recording.append(indata.copy())
-                    self.current_level = np.max(np.abs(indata))
-                
-                self.is_testing = True
-                with sd.InputStream(device=in_dev, samplerate=self.sample_rate, channels=1, callback=_rec_callback):
-                    time.sleep(duration)
-                self.is_testing = False
-                
-                recording = np.concatenate(recording).flatten().astype(np.float32)
-                rec_vol = np.max(np.abs(recording))
-                mean_vol = np.mean(np.abs(recording))
-                print(f"Recording finished. Samples: {len(recording)}. Max vol: {rec_vol:.4f}, Mean vol: {mean_vol:.4f}")
-                
-                if rec_vol < 0.001:
-                    print("WARNING: Recording is silent or very quiet. Check your microphone device!")
 
-                # 2. Process EVERYTHING at once for highest Pedalboard/PhaseVocoder quality
-                print(f"Processing test phrase ({self.current_effect})...")
-                
-                # Reset effects state
-                self.ai_buffer.clear()
-                
-                block = recording.reshape(-1, 1)
-                final_audio = self._process_block(block, self.current_effect).flatten()
-                
-                # Normalize to prevent clipping/distortion in playback
-                max_val = np.max(np.abs(final_audio))
-                if max_val > 0.1: # Only normalize if it's loud enough to care
-                    final_audio = final_audio / max_val * 0.9
-                
-                # Store for manual comparison (Layer 2)
-                self.last_recorded_original = recording
-                self.last_recorded_processed = final_audio
-                
-                # 3. Playback to DEFAULT output (physical speakers)
-                out_dev = sd.default.device[1] 
-                print(f"Playing back transformed test to device {out_dev}...")
-                sd.play(final_audio, self.sample_rate, device=out_dev)
-                sd.wait()
-            except Exception as e:
-                print(f"Test Error: {e}")
-            
-            if callback: 
-                callback()
-
-        threading.Thread(target=_test_thread, daemon=True).start()
-
-    def run_static_test(self, file_path: str, callback: Optional[Callable] = None):
-        """Layer 1: Process a static file and play it back."""
-        def _static_thread():
-            if not os.path.exists(file_path):
-                print(f"Static file not found: {file_path}")
-                if callback: callback()
-                return
-            
-            try:
-                import scipy.io.wavfile as wavfile
-                sr, data = wavfile.read(file_path)
-                
-                # Convert to mono float32
-                if data.dtype == np.int16:
-                    data = data.astype(np.float32) / 32768.0
-                elif data.dtype != np.float32:
-                    data = data.astype(np.float32) / np.max(np.abs(data))
-                
-                if len(data.shape) > 1:
-                    data = data[:, 0]
-                
-                # Process in blocks
-                processed_blocks = []
-                for i in range(0, len(data), self.block_size):
-                    block = data[i:i + self.block_size].reshape(-1, 1)
-                    if len(block) < self.block_size:
-                        block = np.pad(block, ((0, self.block_size - len(block)), (0, 0)))
-                    
-                    processed = self._process_block(block, self.current_effect)
-                    processed_blocks.append(processed.flatten())
-                
-                final_audio = np.concatenate(processed_blocks)
-                self.last_static_processed = final_audio
-                
-                # Playback
-                out_dev = sd.default.device[1]
-                print(f"Playing static test from {file_path}...")
-                sd.play(final_audio, self.sample_rate, device=out_dev)
-                sd.wait()
-            except Exception as e:
-                print(f"Static Test Error: {e}")
-            
-            if callback: callback()
-        
-        threading.Thread(target=_static_thread, daemon=True).start()
-
-    def replay_recorded(self, original=False):
-        """Replay Layer 2 audio (original or processed)."""
-        audio = self.last_recorded_original if original else self.last_recorded_processed
-        if audio is not None:
-            out_dev = sd.default.device[1]
-            sd.play(audio, self.sample_rate, device=out_dev)
-
-    def replay_test(self):
-        """Replay the last recorded test audio in a separate thread."""
-        def _replay():
-            if self.last_test_audio is not None and sd is not None:
-                try:
-                    out_dev = sd.default.device[1]
-                    print(f"Replaying last test ({len(self.last_test_audio)} samples) to device {out_dev}...")
-                    sd.play(self.last_test_audio, self.sample_rate, device=out_dev)
-                    sd.wait()
-                except Exception as e:
-                    print(f"Replay Error: {e}")
-            else:
-                print("No test audio to replay or sounddevice unavailable.")
-        threading.Thread(target=_replay, daemon=True).start()
 
     def get_performance_stats(self):
         """Return dict of performance metrics."""

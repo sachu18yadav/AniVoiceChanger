@@ -14,9 +14,13 @@ import torch
 import torch.nn.functional as F
 import librosa
 
-# Limit CPU threads for gaming friendliness
-torch.set_num_threads(2)
-torch.set_num_interop_threads(2)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+is_half = device == "cuda"  # Use half precision on GPU for massive speed boost
+
+if device == "cpu":
+    # Limit CPU threads for gaming friendliness
+    torch.set_num_threads(2)
+    torch.set_num_interop_threads(2)
 
 MODELS_DIR = Path(__file__).resolve().parent.parent / "virtual_mic" / "models"
 HUBERT_CACHE = Path(__file__).resolve().parent / "hubert_cache"
@@ -54,6 +58,14 @@ def load_hubert():
         )
 
     _hubert_model, _hubert_proj = load_rvc_hubert_to_torchaudio(str(checkpoint_path))
+    _hubert_model = _hubert_model.to(device)
+    if is_half: _hubert_model = _hubert_model.half()
+    _hubert_model.eval()
+    
+    _hubert_proj = _hubert_proj.to(device)
+    if is_half: _hubert_proj = _hubert_proj.half()
+    _hubert_proj.eval()
+    
     _hubert_loaded = True
     return _hubert_model, _hubert_proj
 
@@ -62,7 +74,8 @@ def extract_hubert_features(model, proj, audio_16k, version="v2"):
     """
     Extract HuBERT features matching the real RVC pipeline.
     """
-    waveform = torch.from_numpy(audio_16k).float().unsqueeze(0)  # (1, T)
+    waveform = torch.from_numpy(audio_16k).float().unsqueeze(0).to(device)  # (1, T)
+    if is_half: waveform = waveform.half()
     
     with torch.no_grad():
         if version == "v2":
@@ -105,7 +118,12 @@ def apply_index(feats, index, big_npy, index_rate=0.75):
     weight = np.square(1 / (score + 1e-6))
     weight /= weight.sum(axis=1, keepdims=True)
     retrieved = np.sum(big_npy[ix] * np.expand_dims(weight, axis=2), axis=1)
-    feats = torch.from_numpy(retrieved).unsqueeze(0).float() * index_rate + (1 - index_rate) * feats
+    
+    retrieved_t = torch.from_numpy(retrieved).unsqueeze(0).to(device)
+    if is_half: retrieved_t = retrieved_t.half()
+    else: retrieved_t = retrieved_t.float()
+        
+    feats = retrieved_t * index_rate + (1 - index_rate) * feats
     return feats
 
 
@@ -122,8 +140,7 @@ def get_f0(audio_16k, p_len, f0_up_key=0):
     f0_mel_max = 1127 * np.log(1 + f0_max / 700)
 
     audio_double = audio_16k.astype(np.double)
-    f0, t = pyworld.harvest(audio_double, fs=SR, f0_ceil=f0_max, f0_floor=f0_min,
-                            frame_period=WINDOW / SR * 1000)
+    f0, t = pyworld.dio(audio_double, fs=SR, f0_ceil=f0_max, f0_floor=f0_min, frame_period=WINDOW / SR * 1000)
     f0 = pyworld.stonemask(audio_double, f0, t, SR)
     f0 = medfilt(f0.astype(np.float64), 3)
 
@@ -163,12 +180,15 @@ def load_rvc_model(model_path):
 
     try:
         if version == "v1":
-            net_g = SynthesizerTrnMs256NSFsid(*config, is_half=False) if f0_flag else SynthesizerTrnMs256NSFsid_nono(*config)
+            net_g = SynthesizerTrnMs256NSFsid(*config, is_half=is_half) if f0_flag else SynthesizerTrnMs256NSFsid_nono(*config)
         else:
-            net_g = SynthesizerTrnMs768NSFsid(*config, is_half=False) if f0_flag else SynthesizerTrnMs768NSFsid_nono(*config)
+            net_g = SynthesizerTrnMs768NSFsid(*config, is_half=is_half) if f0_flag else SynthesizerTrnMs768NSFsid_nono(*config)
         if hasattr(net_g, 'enc_q'): del net_g.enc_q
         net_g.load_state_dict(cpt["weight"], strict=False)
-        net_g.eval().float()
+        net_g = net_g.to(device)
+        if is_half: net_g = net_g.half()
+        else: net_g = net_g.float()
+        net_g.eval()
         print(f"  ✓ Model: {model_path.stem} (v{version}, sr={tgt_sr}, f0={'yes' if f0_flag else 'no'})")
     except Exception as e:
         print(f"  Failed: {e}"); traceback.print_exc(); return None, None
@@ -215,10 +235,15 @@ def infer(audio_np, sr, model, model_info, f0_up_key=0, index=None, big_npy=None
         feats = feats[:, :p_len, :]
 
     # Tensors
-    phone_lengths = torch.tensor([p_len]).long()
-    sid = torch.tensor([0]).long()
-    pitch = torch.from_numpy(f0_coarse).long().unsqueeze(0) if model_info["f0"] else None
-    pitchf = torch.from_numpy(f0_raw).float().unsqueeze(0) if model_info["f0"] else None
+    phone_lengths = torch.tensor([p_len]).long().to(device)
+    sid = torch.tensor([0]).long().to(device)
+    pitch = torch.from_numpy(f0_coarse).long().unsqueeze(0).to(device) if model_info["f0"] else None
+    
+    pitchf = None
+    if model_info["f0"]:
+        pitchf = torch.from_numpy(f0_raw).unsqueeze(0).to(device)
+        if is_half: pitchf = pitchf.half()
+        else: pitchf = pitchf.float()
 
     # Synthesis
     with torch.no_grad():
