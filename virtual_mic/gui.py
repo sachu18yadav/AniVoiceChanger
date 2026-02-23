@@ -97,6 +97,7 @@ class AppRouter(ctk.CTk):
         # Setup passthrough & loop
         self.passthrough_stream = None
         self.passthrough_active = False
+        self._model_cache = {}  # { model_pth_path: RVCVoiceConverter } - avoids reloading per test
 
         # Perform layout routing
         self.on_backend_toggle(self.app_state.backend_mode)
@@ -154,7 +155,10 @@ class AppRouter(ctk.CTk):
                         pths = [f for f in os.listdir(model_dir) if f.endswith(".pth") and not f.startswith("D_") and not f.startswith("G_")]
                         if pths: model_pth = os.path.join(model_dir, pths[0])
                     if os.path.exists(model_pth):
-                        converter = rvc_wrapper.RVCVoiceConverter(model_pth, sample_rate=48000)
+                        converter = self._model_cache.get(model_pth)
+                        if converter is None:
+                            converter = rvc_wrapper.RVCVoiceConverter(model_pth, sample_rate=48000)
+                            self._model_cache[model_pth] = converter
                         converter.pitch = self.app_state.pitch
                         self.local_engine.ai_converter = converter
                 except Exception as e:
@@ -267,7 +271,10 @@ class AppRouter(ctk.CTk):
                         pths = [f for f in os.listdir(model_dir) if f.endswith(".pth") and not f.startswith("D_") and not f.startswith("G_")]
                         if pths: model_pth = os.path.join(model_dir, pths[0])
                     
-                    converter = rvc_wrapper.RVCVoiceConverter(model_pth, sample_rate=48000)
+                    converter = self._model_cache.get(model_pth)
+                    if converter is None:
+                        converter = rvc_wrapper.RVCVoiceConverter(model_pth, sample_rate=48000)
+                        self._model_cache[model_pth] = converter
                     converter.pitch = self.app_state.pitch
                     
                     final_audio = converter.convert(recording)
