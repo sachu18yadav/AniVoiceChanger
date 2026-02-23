@@ -111,10 +111,10 @@ class VoiceChangerEngine:
                 if hasattr(self, 'ai_out_queue') and len(self.ai_out_queue) >= len(processed):
                     chunk = self.ai_out_queue[:len(processed)]
                     self.ai_out_queue = self.ai_out_queue[len(processed):]
-                    processed = np.array(chunk).reshape(-1, 1)
+                    processed = np.array(chunk, dtype=np.float32).reshape(-1, 1)
                 else:
                     # If AI hasn't produced its first chunk yet, output silence
-                    processed = np.zeros_like(processed)
+                    processed = np.zeros_like(processed, dtype=np.float32)
             else:
                 # Fallback to Anime Girl DSP if AI not loaded but selected
                 processed = self.anime_voice.process(processed, self.semitones)
@@ -124,7 +124,7 @@ class VoiceChangerEngine:
             from effects import simple_echo
             processed = simple_echo(processed, delay_ms=self.echo_delay, decay=self.echo_decay, sample_rate=self.sample_rate)
             
-        return processed
+        return processed.astype(np.float32)
 
     def _process_and_play(self):
         """Main processing loop with crossfade support."""
@@ -245,7 +245,7 @@ class VoiceChangerEngine:
                 # Fallback to PyTorch wrapper if ONNX not found
                 try:
                     from ai_engine.rvc_wrapper import RVCVoiceConverter
-                    pth_models = [f for f in os.listdir("models") if f.endswith(".pth")]
+                    pth_models = [f for f in os.listdir("models") if f.endswith(".pth") and not f.startswith("D_") and not f.startswith("G_")]
                     if pth_models:
                         model_path = get_model_path("models", pth_models[0])
                         self.ai_converter = RVCVoiceConverter(model_path, sample_rate=self.sample_rate)

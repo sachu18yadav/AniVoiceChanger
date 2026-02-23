@@ -38,6 +38,9 @@ class AppRouter(ctk.CTk):
         self.local_engine = VoiceChangerEngine(sample_rate=48000, block_size=512)
         self.app_state.local_engine = self.local_engine
         
+        in_devs, _ = self.local_engine.get_devices()
+        self.app_state.input_devices = in_devs
+
         # Window
         self.title("CHARACTER VOICE PRO")
         self.geometry("1000x700")
@@ -140,7 +143,25 @@ class AppRouter(ctk.CTk):
             self.local_engine.ai_converter.pitch = val
 
     def on_profile_change(self, val):
-        pass # The state is updated, engine pulls it dynamically on process
+        if self.app_state.backend_mode == "Local AI":
+            def _load_new():
+                try:
+                    from ai_engine import rvc_wrapper
+                    model_dir = os.path.join("models", val)
+                    model_pth = os.path.join(model_dir, f"{val}.pth")
+                    if not os.path.exists(model_pth): model_pth = os.path.join(model_dir, "model.pth")
+                    if not os.path.exists(model_pth):
+                        pths = [f for f in os.listdir(model_dir) if f.endswith(".pth") and not f.startswith("D_") and not f.startswith("G_")]
+                        if pths: model_pth = os.path.join(model_dir, pths[0])
+                    if os.path.exists(model_pth):
+                        converter = rvc_wrapper.RVCVoiceConverter(model_pth, sample_rate=48000)
+                        converter.pitch = self.app_state.pitch
+                        self.local_engine.ai_converter = converter
+                except Exception as e:
+                    print(f"Profile Change Error: {e}")
+            threading.Thread(target=_load_new, daemon=True).start()
+        elif self.app_state.backend_mode == "Local DSP":
+            self.local_engine.current_effect = val
         
     def _get_effect(self):
         m = self.app_state.backend_mode
@@ -166,7 +187,7 @@ class AppRouter(ctk.CTk):
                     model_pth = os.path.join(model_dir, f"{self.app_state.profile}.pth")
                     if not os.path.exists(model_pth): model_pth = os.path.join(model_dir, "model.pth")
                     if not os.path.exists(model_pth):
-                        pths = [f for f in os.listdir(model_dir) if f.endswith(".pth") and not f.startswith("D_")]
+                        pths = [f for f in os.listdir(model_dir) if f.endswith(".pth") and not f.startswith("D_") and not f.startswith("G_")]
                         if pths: model_pth = os.path.join(model_dir, pths[0])
                     
                     self.local_engine.ai_converter = rvc_wrapper.RVCVoiceConverter(model_pth, sample_rate=48000)
@@ -243,14 +264,13 @@ class AppRouter(ctk.CTk):
                     model_pth = os.path.join(model_dir, f"{self.app_state.profile}.pth")
                     if not os.path.exists(model_pth): model_pth = os.path.join(model_dir, "model.pth")
                     if not os.path.exists(model_pth):
-                        pths = [f for f in os.listdir(model_dir) if f.endswith(".pth") and not f.startswith("D_")]
+                        pths = [f for f in os.listdir(model_dir) if f.endswith(".pth") and not f.startswith("D_") and not f.startswith("G_")]
                         if pths: model_pth = os.path.join(model_dir, pths[0])
                     
                     converter = rvc_wrapper.RVCVoiceConverter(model_pth, sample_rate=48000)
                     converter.pitch = self.app_state.pitch
                     
-                    audio_16k = recording # In reality librosa resample
-                    final_audio = converter.convert(audio_16k)
+                    final_audio = converter.convert(recording)
                     if final_audio is None: final_audio = recording
                 else:
                     self.local_engine.semitones = self.app_state.pitch
