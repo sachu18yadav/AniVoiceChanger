@@ -249,6 +249,11 @@ class VoiceChangerEngine:
                     if pth_models:
                         model_path = get_model_path("models", pth_models[0])
                         self.ai_converter = RVCVoiceConverter(model_path, sample_rate=self.sample_rate)
+                    else:
+                        fallbacks = [f for f in os.listdir("models") if f.endswith(".pth") and not f.startswith("D_")]
+                        if fallbacks:
+                            model_path = get_model_path("models", fallbacks[0])
+                            self.ai_converter = RVCVoiceConverter(model_path, sample_rate=self.sample_rate)
                 except ImportError:
                     print("RVC Wrapper not found.")
             
