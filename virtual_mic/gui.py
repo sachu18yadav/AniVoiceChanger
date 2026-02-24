@@ -36,11 +36,37 @@ class AppRouter(ctk.CTk):
         self.app_state = AppState()
         self.elevenlabs = ElevenLabsClient()
         self.local_engine = VoiceChangerEngine(sample_rate=48000, block_size=512)
+        
+        # Explicitly bind Virtual Mic to Discord's CABLE Input
+        try:
+            target_out = sd.default.device[1] if sd else 0
+            if sd:
+                for i, dev in enumerate(sd.query_devices()):
+                    if dev['max_output_channels'] > 0 and 'cable input' in dev['name'].lower() and 'vb-audio' in dev['name'].lower():
+                        target_out = i
+                        break
+            self.local_engine.output_device = target_out
+        except Exception as e:
+            print("Failed to auto-bind Virtual Cable output:", e)
+            
+        # Explicitly bind Input to a physical Microphone to avoid Windows VB-Cable Output loopbacks
+        try:
+            target_in = sd.default.device[0] if sd else 0
+            if sd:
+                # 1. First try to find a named physical mic
+                for i, dev in enumerate(sd.query_devices()):
+                    name = dev['name'].lower()
+                    if dev['max_input_channels'] > 0 and 'cable' not in name and 'steam' not in name:
+                        if 'realtek' in name or 'microphone array' in name:
+                            target_in = i
+                            break
+            self.local_engine.input_device = target_in
+        except Exception as e:
+            print("Failed to auto-bind Physical Microphone:", e)
+            
+        self.app_state.input_devices, _ = self.local_engine.get_devices()
         self.app_state.local_engine = self.local_engine
         
-        in_devs, _ = self.local_engine.get_devices()
-        self.app_state.input_devices = in_devs
-
         # Window
         self.title("CHARACTER VOICE PRO")
         self.geometry("1000x700")
@@ -97,7 +123,6 @@ class AppRouter(ctk.CTk):
         # Setup passthrough & loop
         self.passthrough_stream = None
         self.passthrough_active = False
-        self._model_cache = {}  # { model_pth_path: RVCVoiceConverter } - avoids reloading per test
 
         # Perform layout routing
         self.on_backend_toggle(self.app_state.backend_mode)
@@ -133,9 +158,15 @@ class AppRouter(ctk.CTk):
             self.pipeline.rebuild_radio_buttons(presets)
 
     def on_device_change(self, val):
-        devices, _ = self.local_engine.get_devices()
-        idx = next((i for i, d in enumerate(devices) if d in val), 0)
-        self.local_engine.input_device = idx
+        import sounddevice as sd
+        try:
+            for i, dev in enumerate(sd.query_devices()):
+                if dev['max_input_channels'] > 0 and val in dev['name']:
+                    self.local_engine.input_device = i
+                    print(f"Mapped Input '{val}' to Global Hardware ID: {i}")
+                    break
+        except Exception as e:
+            print(f"Device change routing error: {e}")
 
     def on_slider_change(self, val):
         self.local_engine.semitones = val
@@ -144,28 +175,7 @@ class AppRouter(ctk.CTk):
             self.local_engine.ai_converter.pitch = val
 
     def on_profile_change(self, val):
-        if self.app_state.backend_mode == "Local AI":
-            def _load_new():
-                try:
-                    from ai_engine import rvc_wrapper
-                    model_dir = os.path.join("models", val)
-                    model_pth = os.path.join(model_dir, f"{val}.pth")
-                    if not os.path.exists(model_pth): model_pth = os.path.join(model_dir, "model.pth")
-                    if not os.path.exists(model_pth):
-                        pths = [f for f in os.listdir(model_dir) if f.endswith(".pth") and not f.startswith("D_") and not f.startswith("G_")]
-                        if pths: model_pth = os.path.join(model_dir, pths[0])
-                    if os.path.exists(model_pth):
-                        converter = self._model_cache.get(model_pth)
-                        if converter is None:
-                            converter = rvc_wrapper.RVCVoiceConverter(model_pth, sample_rate=48000)
-                            self._model_cache[model_pth] = converter
-                        converter.pitch = self.app_state.pitch
-                        self.local_engine.ai_converter = converter
-                except Exception as e:
-                    print(f"Profile Change Error: {e}")
-            threading.Thread(target=_load_new, daemon=True).start()
-        elif self.app_state.backend_mode == "Local DSP":
-            self.local_engine.current_effect = val
+        pass # The state is updated, engine pulls it dynamically on process
         
     def _get_effect(self):
         m = self.app_state.backend_mode
@@ -177,10 +187,11 @@ class AppRouter(ctk.CTk):
     # --- REALTIME ENGINE ---
     def toggle_local_realtime(self, btn):
         if not self.app_state.local_test_active:
-            effect = self._get_effect()
-            self.local_engine.current_effect = effect
+            selected_effect = self._get_effect()
+            start_effect = "passthrough" if self.app_state.ptt_enabled else selected_effect
+            self.local_engine.current_effect = start_effect
             
-            if effect == "ai":
+            if selected_effect == "ai":
                 btn.configure(text="LOADING MODEL...", fg_color="#DD8800")
                 self.update_idletasks()
                 
@@ -191,18 +202,19 @@ class AppRouter(ctk.CTk):
                     model_pth = os.path.join(model_dir, f"{self.app_state.profile}.pth")
                     if not os.path.exists(model_pth): model_pth = os.path.join(model_dir, "model.pth")
                     if not os.path.exists(model_pth):
-                        pths = [f for f in os.listdir(model_dir) if f.endswith(".pth") and not f.startswith("D_") and not f.startswith("G_")]
+                        pths = [f for f in os.listdir(model_dir) if f.endswith(".pth") and not f.startswith("D_")]
                         if pths: model_pth = os.path.join(model_dir, pths[0])
                     
-                    self.local_engine.ai_converter = rvc_wrapper.RVCVoiceConverter(model_pth, sample_rate=48000)
+                    if not hasattr(self.local_engine, 'ai_converter') or not self.local_engine.ai_converter:
+                        self.local_engine.ai_converter = rvc_wrapper.RVCVoiceConverter(model_pth, sample_rate=48000)
                     self.local_engine.ai_converter.pitch = self.app_state.pitch
                     
-                    self.local_engine.start(effect=effect, semitones=self.app_state.pitch)
+                    self.local_engine.start(effect=start_effect, semitones=self.app_state.pitch)
                     self.app_state.update("local_test_active", True)
                     self.after(0, lambda: btn.configure(text="LOCAL REALTIME ON", fg_color="#00AA00"))
                 threading.Thread(target=_load, daemon=True).start()
             else:
-                self.local_engine.start(effect=effect, semitones=self.app_state.pitch)
+                self.local_engine.start(effect=start_effect, semitones=self.app_state.pitch)
                 self.app_state.update("local_test_active", True)
                 btn.configure(text="LOCAL REALTIME ON", fg_color="#00AA00")
         else:
@@ -239,7 +251,7 @@ class AppRouter(ctk.CTk):
         self.passthrough_active = False
 
     # --- RECORDING LAB LOGIC ---
-    def run_record_test(self, rec_btn, replay_btn):
+    def run_record_test(self, rec_btn, realtime_btn, replay_btn):
         if self.app_state.local_record_active: return
         self.app_state.local_record_active = True
         self.stop_passthrough()
@@ -258,6 +270,7 @@ class AppRouter(ctk.CTk):
                     time.sleep(5.0)
                 
                 recording = np.concatenate(recording).flatten().astype(np.float32)
+                
                 self.after(0, lambda: rec_btn.configure(text="PROCESSING...", fg_color="#005BB5"))
                 
                 effect = self._get_effect()
@@ -268,17 +281,42 @@ class AppRouter(ctk.CTk):
                     model_pth = os.path.join(model_dir, f"{self.app_state.profile}.pth")
                     if not os.path.exists(model_pth): model_pth = os.path.join(model_dir, "model.pth")
                     if not os.path.exists(model_pth):
-                        pths = [f for f in os.listdir(model_dir) if f.endswith(".pth") and not f.startswith("D_") and not f.startswith("G_")]
+                        pths = [f for f in os.listdir(model_dir) if f.endswith(".pth") and not f.startswith("D_")]
                         if pths: model_pth = os.path.join(model_dir, pths[0])
                     
-                    converter = self._model_cache.get(model_pth)
-                    if converter is None:
-                        converter = rvc_wrapper.RVCVoiceConverter(model_pth, sample_rate=48000)
-                        self._model_cache[model_pth] = converter
+                    converter = rvc_wrapper.RVCVoiceConverter(model_pth, sample_rate=48000)
                     converter.pitch = self.app_state.pitch
                     
-                    final_audio = converter.convert(recording)
-                    if final_audio is None: final_audio = recording
+                    # 1. We MUST chunk the recording into strict 600ms blocks due to the static ONNX 60-frame logic
+                    # Using absolute hard-chunking because mathematical crossfading causes robotic phase cancellation
+                    chunk_size = 28800 # exactly 600ms at 48000Hz
+                    
+                    # Pad recording to be a perfect multiple of chunk_size to satisfy static ONNX
+                    pad_len = chunk_size - (len(recording) % chunk_size)
+                    if pad_len != chunk_size:
+                        padded_rec = np.pad(recording, (0, pad_len), mode='constant')
+                    else:
+                        padded_rec = recording
+                        
+                    num_chunks = len(padded_rec) // chunk_size
+                    processed_chunks = []
+                    
+                    for c_idx in range(num_chunks):
+                        start = c_idx * chunk_size
+                        end = start + chunk_size
+                        chunk_48k = padded_rec[start:end]
+                        
+                        chunk_out_48k = converter.convert(chunk_48k)
+                        
+                        if chunk_out_48k is not None:
+                            processed_chunks.append(chunk_out_48k.flatten())
+                        else:
+                            processed_chunks.append(chunk_48k)
+                            
+                    final_audio = np.concatenate(processed_chunks) if processed_chunks else recording
+                    # Trim back exactly to the original length to maintain precise timing
+                    if pad_len != chunk_size:
+                        final_audio = final_audio[:-pad_len]
                 else:
                     self.local_engine.semitones = self.app_state.pitch
                     self.local_engine.anime_voice.pitch_shift = self.app_state.pitch
@@ -286,14 +324,29 @@ class AppRouter(ctk.CTk):
 
                 self.last_recorded_audio = final_audio
                 self.after(0, lambda: rec_btn.configure(text="PLAYING...", fg_color="#005BB5"))
-                sd.play(final_audio, 48000)
-                sd.wait()
+                
+                # Intelligent Headphone/Speaker routing for local testing
+                # We MUST bypass VB-Cable explicitly, or the user won't hear the test!
+                test_out_dev = sd.default.device[1]
+                try:
+                    for i, dev in enumerate(sd.query_devices()):
+                        name = dev['name'].lower()
+                        if dev['max_output_channels'] > 0 and 'cable' not in name and 'vb-audio' not in name:
+                            if 'speaker' in name or 'headphone' in name or 'realtek' in name:
+                                test_out_dev = i
+                                break
+                    sd.play(final_audio, 48000, device=test_out_dev)
+                    sd.wait()
+                except:
+                    sd.play(final_audio, 48000)
+                    sd.wait()
 
             except Exception as e:
                 print(f"Record Error: {e}")
             finally:
                 self.app_state.local_record_active = False
-                self.after(0, lambda: rec_btn.configure(text="RECORD TEST", fg_color="#007AFF"))
+                self.after(0, lambda: rec_btn.configure(text="TEST LOCAL (5s)", fg_color="#007AFF"))
+                self.after(0, lambda: realtime_btn.configure(state="normal"))
                 self.after(0, lambda: replay_btn.pack(side="left", padx=(0, 3)))
                 self.start_passthrough()
                 
@@ -303,8 +356,21 @@ class AppRouter(ctk.CTk):
         if not hasattr(self, 'last_recorded_audio') or self.last_recorded_audio is None: return
         btn.configure(state="disabled")
         def _play():
-            sd.play(self.last_recorded_audio, 48000)
-            sd.wait()
+            test_out_dev = None
+            if sd:
+                test_out_dev = sd.default.device[1]
+                for i, dev in enumerate(sd.query_devices()):
+                    name = dev['name'].lower()
+                    if dev['max_output_channels'] > 0 and 'cable' not in name and 'vb-audio' not in name:
+                        if 'speaker' in name or 'headphone' in name or 'realtek' in name:
+                            test_out_dev = i
+                            break
+            try:
+                sd.play(self.last_recorded_audio, 48000, device=test_out_dev)
+                sd.wait()
+            except:
+                sd.play(self.last_recorded_audio, 48000)
+                sd.wait()
             self.after(0, lambda: btn.configure(state="normal"))
         threading.Thread(target=_play, daemon=True).start()
 
@@ -340,8 +406,16 @@ class AppRouter(ctk.CTk):
                 return
             
             if self.app_state.ptt_enabled and kname == self.app_state.ptt_hotkey and not self.app_state.ptt_active:
-                self.stop_passthrough()
                 self.app_state.ptt_active = True
+                
+                # ZERO-LATENCY REALTIME PTT HOTSWAP
+                if self.app_state.local_test_active:
+                    self.local_engine.next_effect = self._get_effect()
+                    self.after(0, lambda: self.header.update_status("● AI PTT LIVE", "#FF3333"))
+                    return
+                    
+                # LEGACY ASYNC PTT (When Realtime is OFF)
+                self.stop_passthrough()
                 self.app_state.ptt_chunks = []
                 self.app_state.ptt_start_time = time.time()
                 
@@ -358,6 +432,13 @@ class AppRouter(ctk.CTk):
         def on_release(key):
             if not key: return
             if self.app_state.ptt_enabled and get_key_name(key) == self.app_state.ptt_hotkey and self.app_state.ptt_active:
+                # ZERO-LATENCY REALTIME PTT HOTSWAP
+                if self.app_state.local_test_active:
+                    self.app_state.ptt_active = False
+                    self.local_engine.next_effect = "passthrough"
+                    self.after(0, lambda: self.header.update_status("● LOCAL REALTIME ON", "#00AA00"))
+                    return
+                    
                 self.after(0, self.stop_global_ptt)
 
         def run_listener():
@@ -414,17 +495,49 @@ class AppRouter(ctk.CTk):
     def process_local_ptt(self, recording, mode):
         try:
             recording = recording.flatten()
+            
             effect = self._get_effect()
             
             if effect == "ai":
-                if hasattr(self.local_engine, 'ai_converter') and self.local_engine.ai_converter and self.local_engine.ai_converter.model:
-                    import librosa
-                    audio_16k = librosa.resample(recording, orig_sr=48000, target_sr=16000)
-                    converted = self.local_engine.ai_converter.convert(audio_16k)
-                    final_audio = converted if converted is not None else recording
+                if not hasattr(self.local_engine, 'ai_converter') or not self.local_engine.ai_converter:
+                    from ai_engine import rvc_wrapper
+                    model_dir = os.path.join("models", self.app_state.profile)
+                    model_pth = os.path.join(model_dir, f"{self.app_state.profile}.pth")
+                    if not os.path.exists(model_pth): model_pth = os.path.join(model_dir, "model.pth")
+                    if not os.path.exists(model_pth):
+                        pths = [f for f in os.listdir(model_dir) if f.endswith(".pth") and not f.startswith("D_")]
+                        if pths: model_pth = os.path.join(model_dir, pths[0])
+                    self.local_engine.ai_converter = rvc_wrapper.RVCVoiceConverter(model_pth, sample_rate=48000)
+                    self.local_engine.ai_converter.pitch = self.app_state.pitch
+                    
+                # Chunk into exactly 600ms (28800 samples)
+                chunk_size = 28800
+                processed_chunks = []
+                
+                # Pad recording to be a perfect multiple of chunk_size to satisfy static ONNX
+                pad_len = chunk_size - (len(recording) % chunk_size)
+                if pad_len != chunk_size:
+                    padded_rec = np.pad(recording, (0, pad_len), mode='constant')
                 else:
-                    print("AI not loaded. Doing nothing.")
-                    final_audio = recording
+                    padded_rec = recording
+                    
+                num_chunks = len(padded_rec) // chunk_size
+                for c_idx in range(num_chunks):
+                    start = c_idx * chunk_size
+                    end = start + chunk_size
+                    chunk_48k = padded_rec[start:end]
+                    
+                    chunk_out_48k = self.local_engine.ai_converter.convert(chunk_48k)
+                    
+                    if chunk_out_48k is not None:
+                        processed_chunks.append(chunk_out_48k.flatten())
+                    else:
+                        processed_chunks.append(chunk_48k)
+                        
+                final_audio = np.concatenate(processed_chunks) if processed_chunks else recording
+                # Trim back exactly to the original length to maintain precise timing
+                if pad_len != chunk_size:
+                    final_audio = final_audio[:-pad_len]
             else:
                 self.local_engine.semitones = self.app_state.pitch
                 self.local_engine.anime_voice.pitch_shift = self.app_state.pitch

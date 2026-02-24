@@ -35,23 +35,45 @@ class VoiceChangerEngine:
         self.fade_index = 0
         self.fade_steps = 10 # Number of blocks for crossfade
         
-        # New: Effects Configuration
+        # Effects Configuration
         self.use_noise_gate = False
-        self.gate_threshold = 0.002 # Lower default threshold
+        self.gate_threshold = 0.002
         self.use_echo = False
         self.echo_delay = 200
         self.echo_decay = 0.4
 
         self.worker_thread = None
+        self.ai_worker_thread = None  # Dedicated AI inference thread
         self.input_stream = None
+        self.input_device = None
+        
+        # Auto-detect VB-Audio Cable for Output
+        self.output_device = None
+        if sd:
+            try:
+                for i, dev in enumerate(sd.query_devices()):
+                    if dev['max_output_channels'] > 0 and 'cable input' in dev['name'].lower() and 'vb-audio' in dev['name'].lower():
+                        self.output_device = i
+                        break
+            except Exception: pass
         
         # AI Engine Components
         from effects import AnimeGirlVoice
         self.anime_voice = AnimeGirlVoice(sample_rate=self.sample_rate)
         self.ai_converter = None
-        self.ai_buffer = StreamBuffer(target_size=4096)
+        # Decoupled AI pipeline queues:
+        # audio_queue -> [AI worker] -> ai_out_queue -> [output thread]
+        self.ai_in_queue = queue.Queue(maxsize=4)   # raw input chunks for inference
+        self.ai_out_queue_samples = []              # flat float32 sample output ring
+        self.ai_out_lock = threading.Lock()
+        # 28800 (600ms) window, step 24000 (500ms) = 100ms true overlap context
+        self.ai_buffer = StreamBuffer(target_size=28800, step_size=24000)
+        self._last_ai_overlap = None                # Holds the previous overlap for crossfading
+        self._last_played_audio = np.array([], dtype=np.float32)
+        self._starving_frames = 0
+
         self.is_loading_ai = False
-        self.use_fp16 = True # Default to half-precision for GPU
+        self.use_fp16 = True
         
         # Test Voice Components
         self.is_testing = False
@@ -82,6 +104,10 @@ class VoiceChangerEngine:
         """Apply the selected voice transformation and DSP chain."""
         processed = block.copy()
         
+        # Apply static Pre-Gain to cleanly boost microphone levels without destroying dynamics
+        processed = processed * 3.0
+        processed = np.clip(processed, -1.0, 1.0)
+        
         # 1. Noise Gate (Early in chain)
         if self.use_noise_gate:
             from effects import noise_gate
@@ -97,26 +123,46 @@ class VoiceChangerEngine:
             processed = pitch_shift(processed, self.semitones, self.sample_rate)
         elif effect == "ai":
             if self.ai_converter:
-                # Add current small block (e.g. 512 samples) to the sliding window
+                # Stage 1: buffer input into chunks, push completed frames to inference queue
                 frame = self.ai_buffer.add(processed)
                 if frame is not None:
-                    # When buffer fills (e.g. 12288 samples), run full AI inference
-                    ai_output = self.ai_converter.convert(frame)
-                    
-                    # Store the fresh large block of AI output
-                    if not hasattr(self, 'ai_out_queue'): self.ai_out_queue = []
-                    self.ai_out_queue.extend(ai_output.flatten().tolist())
+                    try:
+                        self.ai_in_queue.put_nowait(frame)  # non-blocking; drop if full
+                    except queue.Full:
+                        pass  # inference can't keep up; skip frame, avoid blocking output
                 
-                # Pop the exact number of samples we need right now to keep the physical stream moving
-                if hasattr(self, 'ai_out_queue') and len(self.ai_out_queue) >= len(processed):
-                    chunk = self.ai_out_queue[:len(processed)]
-                    self.ai_out_queue = self.ai_out_queue[len(processed):]
-                    processed = np.array(chunk, dtype=np.float32).reshape(-1, 1)
-                else:
-                    # If AI hasn't produced its first chunk yet, output silence
-                    processed = np.zeros_like(processed, dtype=np.float32)
+                # Stage 2: drain the output sample ring to fill this block
+                with self.ai_out_lock:
+                    avail = len(self.ai_out_queue_samples)
+                    need = len(processed.flatten())
+                    if avail >= need:
+                        chunk = self.ai_out_queue_samples[:need]
+                        self.ai_out_queue_samples = self.ai_out_queue_samples[need:]
+                        processed = np.array(chunk, dtype=np.float32).reshape(-1, 1)
+                        # Update history
+                        hist_len = len(self._last_played_audio)
+                        if need >= hist_len:
+                            self._last_played_audio = processed[-hist_len:].flatten().copy()
+                        else:
+                            self._last_played_audio = np.roll(self._last_played_audio, -need)
+                            self._last_played_audio[-need:] = processed.flatten()
+                        self._starving_frames = 0
+                    else:
+                        # Starvation! CPU is slower than realtime.
+                        # Instead of a jarring chunk cutoff or a buzz loop, we do a soft fade to silence.
+                        fallback = np.zeros_like(processed.flatten(), dtype=np.float32)
+                        
+                        # If we just started starving, apply a quick 10ms fade out to the very last played sample
+                        # to prevent a speaker pop
+                        if self._starving_frames == 0 and len(self._last_played_audio) > 0:
+                            fade_len = min(need, 480) # 10ms
+                            last_val = self._last_played_audio[-1]
+                            fade = np.linspace(last_val, 0.0, fade_len, dtype=np.float32)
+                            fallback[:fade_len] = fade
+                            
+                        self._starving_frames += 1
+                        processed = fallback.reshape(-1, 1)
             else:
-                # Fallback to Anime Girl DSP if AI not loaded but selected
                 processed = self.anime_voice.process(processed, self.semitones)
         
         # 3. Modular Effects (Late in chain)
@@ -181,6 +227,61 @@ class VoiceChangerEngine:
             print(f"Engine Error: {e}")
             self.stop_event.set()
 
+    def _ai_inference_worker(self):
+        """Dedicated background thread: pulls buffered frames, runs RVC inference."""
+        # 100ms overlap
+        xfade_samples = int(self.sample_rate * 0.10)
+        
+        while not self.stop_event.is_set():
+            try:
+                frame = self.ai_in_queue.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            try:
+                ai_output = self.ai_converter.convert(frame)
+                if ai_output is not None:
+                    ai_flat = ai_output.flatten()
+                    
+                    # Exact length expected based on ratios
+                    target_len = self.ai_buffer.target_size
+                    step_len = self.ai_buffer.step_size
+                    
+                    # Ensure we have enough audio for OLA
+                    if len(ai_flat) >= target_len:
+                        
+                        # The newly generated chunk (e.g. 600ms)
+                        new_chunk = ai_flat[-target_len:].copy()
+                        
+                        # 1. Crossfade the FIRST 100ms with the saved overlap from the PREVIOUS chunk
+                        if self._last_ai_overlap is not None and len(self._last_ai_overlap) == xfade_samples:
+                            fade_in = np.linspace(0, 1, xfade_samples, dtype=np.float32)
+                            fade_out = np.linspace(1, 0, xfade_samples, dtype=np.float32)
+                            new_chunk[:xfade_samples] = (new_chunk[:xfade_samples] * fade_in) + (self._last_ai_overlap * fade_out)
+                            
+                        # 2. Extract the payload we actually want to play (the 500ms step)
+                        # This includes the crossfaded part, plus the middle part
+                        play_chunk = new_chunk[:step_len].copy()
+                        
+                        # 3. Save the LAST 100ms as the overlap for the NEXT chunk
+                        self._last_ai_overlap = new_chunk[step_len:target_len].copy()
+                        
+                        samples = play_chunk.tolist()
+                    else:
+                        # Fallback if array size is weird (shouldn't happen with strict streaming)
+                        samples = ai_flat.tolist()
+                        self._last_ai_overlap = None
+                    
+                    with self.ai_out_lock:
+                        self.ai_out_queue_samples.extend(samples)
+                        # Prevent unbounded growth: cap to ~2s of audio
+                        cap = self.sample_rate * 2
+                        if len(self.ai_out_queue_samples) > cap:
+                            self.ai_out_queue_samples = self.ai_out_queue_samples[-cap:]
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"[AI Worker] Inference error: {e}")
+
     def start(self, effect="passthrough", semitones=0.0):
         if sd is None: return False
         
@@ -188,7 +289,16 @@ class VoiceChangerEngine:
         self.semitones = semitones
         self.stop_event.clear()
         self.audio_queue = queue.Queue()
+        self.ai_in_queue = queue.Queue(maxsize=4)
+        with self.ai_out_lock:
+            self.ai_out_queue_samples = []
         self.ai_buffer.clear()
+        self._last_ai_overlap = None
+
+        # Start AI inference worker first (so output thread always has a consumer)
+        if effect == "ai":
+            self.ai_worker_thread = threading.Thread(target=self._ai_inference_worker, daemon=True)
+            self.ai_worker_thread.start()
 
         # Start output worker
         self.worker_thread = threading.Thread(target=self._process_and_play, daemon=True)
@@ -219,6 +329,9 @@ class VoiceChangerEngine:
         if self.worker_thread:
             self.worker_thread.join(timeout=1.0)
             self.worker_thread = None
+        if self.ai_worker_thread:
+            self.ai_worker_thread.join(timeout=2.0)
+            self.ai_worker_thread = None
 
     def switch_profile(self, new_effect):
         """Initiate a smooth transition to a new effect."""

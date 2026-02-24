@@ -74,10 +74,11 @@ class AnimeGirlVoice:
             return audio_block
 
 def noise_gate(audio_block, threshold=0.01):
-    """Simple noise gate to remove background hiss."""
+    """Noise gate to remove background hiss without causing clipping distortion."""
     if np is None: return audio_block
-    mask = np.abs(audio_block) > threshold
-    return audio_block * mask
+    if np.max(np.abs(audio_block)) < threshold:
+        return np.zeros_like(audio_block)
+    return audio_block
 
 def simple_echo(audio_block, delay_ms=200, decay=0.4, sample_rate=48000):
     """Placeholder for echo if needed, could also be a Pedalboard effect."""

@@ -61,16 +61,21 @@ class RVCVoiceConverter:
         
         try:
             # RVC requires flat arrays, usually 16k minimum. rvc_infer handles the internal conversions.
-            converted, out_sr = rvc_infer.infer(
+            converted = rvc_infer.infer(
                 audio_np.flatten(), 
                 self.sample_rate, 
                 self.model, 
                 self.info, 
                 f0_up_key=self.pitch, 
                 index=self.index, 
-                big_npy=self.big_npy,
-                rms_mix_rate=0.0  # Bypass heavy CPU processing for latency
+                big_npy=self.big_npy
             )
+            
+            # The original implementation of rvc_infer.py might return (audio, sr) based on the error.
+            if isinstance(converted, tuple):
+                converted, out_sr = converted
+            else:
+                out_sr = self.info["tgt_sr"]
             
             if out_sr != self.sample_rate:
                 import librosa
@@ -78,5 +83,9 @@ class RVCVoiceConverter:
                 
             return converted.reshape(-1, 1).astype(np.float32)
         except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            with open("sine_diagnostic.txt", "a", encoding="utf-8") as f:
+                f.write(f"\nAI CRASH:\n{tb}\n")
             print(f"AI Streaming Error: {e}")
-            return audio_np
+            return None
