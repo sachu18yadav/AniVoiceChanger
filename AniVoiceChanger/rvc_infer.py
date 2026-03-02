@@ -110,7 +110,7 @@ def load_index(index_path):
         import faiss
         index = faiss.read_index(str(index_path))
         big_npy = index.reconstruct_n(0, index.ntotal)
-        print(f"  ✓ Index: {Path(index_path).name} ({index.ntotal} vectors)")
+        print(f"  [OK] Index: {Path(index_path).name} ({index.ntotal} vectors)")
         return index, big_npy
     except Exception as e:
         print(f"  Index load failed: {e}")
@@ -147,8 +147,13 @@ def get_f0(audio_16k, p_len, f0_up_key=0):
     f0_mel_max = 1127 * np.log(1 + f0_max / 700)
 
     audio_double = audio_16k.astype(np.double)
-    # frame_period=20ms — Must remain 20.0ms. Altering this breaks PyTorch tensor synchronization and destroys inference quality.
-    f0, t = pyworld.dio(audio_double, fs=SR, f0_ceil=f0_max, f0_floor=f0_min, frame_period=20.0)
+    # Switch to Harvest for significantly better pitch tracking on fricatives and complex accents
+    f0, t = pyworld.harvest(audio_double, fs=SR, f0_ceil=f0_max, f0_floor=f0_min, frame_period=10.0)
+    # Harvest at 10ms frame_period gives 2x frames, but RVC expects 20ms frames? 
+    # Actually, RVC features are 50fps (20ms). 
+    # pyworld.harvest at 10.0ms matches SR=16000 and the 160-sample window hop. 
+    # 160 / 16000 = 0.010 s = 10ms. 
+    # The previous 20ms was actually mismatching the 160-sample hop!
     f0 = pyworld.stonemask(audio_double, f0, t, SR)
     f0 = medfilt(f0.astype(np.float64), 3)
 
@@ -208,9 +213,9 @@ def load_rvc_model(model_path):
                 print(f"  Exporting {model_path.name} to ONNX for 5x faster CPU inference...")
                 try:
                     export_onnx(net_g, model_info={"f0": f0_flag}, export_path=str(onnx_path))
-                    print(f"  ✓ Exported ONNX to {onnx_path.name}")
+                    print(f"  [OK] Exported ONNX to {onnx_path.name}")
                 except Exception as e:
-                    print(f"  \u26a0\ufe0f Failed to export ONNX: {e}")
+                    print(f"  [WARN] Failed to export ONNX: {e}")
             
             if onnx_path.exists():
                 if model_key not in _COMPILED_MODEL_CACHE:
@@ -226,7 +231,7 @@ def load_rvc_model(model_path):
                         
                     session = ort.InferenceSession(str(onnx_path), sess_options=sess_options, providers=providers)
                     _COMPILED_MODEL_CACHE[model_key] = session
-                    print(f"  ✓ Model (ONNX): {onnx_path.name}")
+                    print(f"  [OK] Model (ONNX): {onnx_path.name}")
                 return _COMPILED_MODEL_CACHE[model_key], {"tgt_sr": tgt_sr, "version": version, "f0": f0_flag, "config": config, "is_onnx": True}
                 
         # PyTorch Fallback (torch.compile)
@@ -234,13 +239,13 @@ def load_rvc_model(model_path):
             try:
                 net_g = torch.compile(net_g, mode="reduce-overhead")
                 _COMPILED_MODEL_CACHE[model_key] = net_g
-                print(f"  ✓ Model: {model_path.stem} (v{version}, sr={tgt_sr}, f0={'yes' if f0_flag else 'no'}) [compiled]")
+                print(f"  [OK] Model: {model_path.stem} (v{version}, sr={tgt_sr}, f0={'yes' if f0_flag else 'no'}) [compiled]")
             except Exception:
                 _COMPILED_MODEL_CACHE[model_key] = net_g
-                print(f"  ✓ Model: {model_path.stem} (v{version}, sr={tgt_sr}, f0={'yes' if f0_flag else 'no'})")
+                print(f"  [OK] Model: {model_path.stem} (v{version}, sr={tgt_sr}, f0={'yes' if f0_flag else 'no'})")
         else:
             net_g = _COMPILED_MODEL_CACHE[model_key]
-            print(f"  ✓ Model: {model_path.stem} (cached+compiled)")
+            print(f"  [OK] Model: {model_path.stem} (cached+compiled)")
     except Exception as e:
         print(f"  Failed: {e}"); traceback.print_exc(); return None, None
     return net_g, {"tgt_sr": tgt_sr, "version": version, "f0": f0_flag, "config": config, "is_onnx": False}
@@ -321,21 +326,31 @@ def infer(audio_np, sr, model, model_info, f0_up_key=0, index=None, big_npy=None
 
     # Resample to 16kHz
     audio_16k = librosa.resample(audio_np, orig_sr=sr, target_sr=16000) if sr != 16000 else audio_np.copy()
-    
-    # Bypassing the extreme 16kHz high-pass filter for voice clarity
-    # audio_16k = signal.filtfilt(bh, ah, audio_16k).astype(np.float32)
     audio_16k = audio_16k.astype(np.float32)
 
-    # Pad
-    t_pad = int(SR * X_PAD)
-    t_pad_tgt = int(tgt_sr * X_PAD)
-    audio_padded = np.pad(audio_16k, (t_pad, t_pad), mode="reflect")
+    # Padding logic for static 60-frame ONNX models
+    # Our model is baked to 60 frames = 9600 samples @ 16kHz.
+    # We want to use these 9600 samples to provide context for the center audio.
+    target_16k_samples = 9600
+    
+    # Calculate how much we need to pad/crop to hit exactly 9600
+    deficit = target_16k_samples - len(audio_16k)
+    if deficit > 0:
+        # Pad symmetrically
+        pad_left = deficit // 2
+        pad_right = deficit - pad_left
+        audio_padded = np.pad(audio_16k, (pad_left, pad_right), mode="reflect")
+        t_pad_16k = pad_left
+    else:
+        # Crop or just use as is (already handled by the ONNX guard later)
+        audio_padded = audio_16k
+        t_pad_16k = 0
 
     # F0
     p_len = audio_padded.shape[0] // WINDOW
     f0_coarse, f0_raw = get_f0(audio_padded, p_len, f0_up_key)
     t1 = time()
-
+    
     # HuBERT features
     hubert, proj = load_hubert()
     feats = extract_hubert_features(hubert, proj, audio_padded, version)
@@ -363,9 +378,6 @@ def infer(audio_np, sr, model, model_info, f0_up_key=0, index=None, big_npy=None
         else: pitchf = pitchf.float()
 
     # --- ONNX Static Shape Guard ---
-    # Our generated ONNX graph is strictly baked to `60` frames to bypass
-    # PyTorch Dynamo shape validation errors. If HuBERT returned slightly more or less 
-    # frames due to STFT float overlaps (e.g. 59 or 61), we must normalize them to 60.
     if model_info.get("is_onnx", False):
         target_len = 60
         phone_lengths = torch.tensor([target_len]).long().to(device)
@@ -387,9 +399,7 @@ def infer(audio_np, sr, model, model_info, f0_up_key=0, index=None, big_npy=None
 
     # Synthesis
     with torch.no_grad():
-        t2_5 = time()
         if model_info.get("is_onnx", False):
-            # ONNX Inference
             ort_inputs = {
                 "feats": feats.cpu().numpy(),
                 "p_len": phone_lengths.cpu().numpy(),
@@ -403,11 +413,9 @@ def infer(audio_np, sr, model, model_info, f0_up_key=0, index=None, big_npy=None
                 audio_out = model.run(None, ort_inputs)[0][0, 0]
                 audio_out = torch.from_numpy(audio_out)
             except Exception as e:
-                # If ONNX shape somehow still mismatches, fallback to avoid total silence
-                print(f"[ONNX Error] {e} - shapes feats:{ort_inputs['feats'].shape} pitch:{ort_inputs['pitch'].shape}")
+                print(f"[ONNX Error] {e}")
                 return None
         else:
-            # PyTorch Inference
             if pitch is not None:
                 audio_out = model.infer(feats, phone_lengths, pitch, pitchf, sid)[0][0, 0]
             else:
@@ -417,19 +425,15 @@ def infer(audio_np, sr, model, model_info, f0_up_key=0, index=None, big_npy=None
     # Evaluate raw output
     result = audio_out.data.cpu().float().numpy()
 
-    # The ONNX model natively drops ~2 edge frames (20ms) inside its convolutions.
-    # We must NEVER use arbitrary back-slicing (:-t_pad_tgt) because the missing frames
-    # cause it to slice deeply into the user's actual audio, deleting 20ms of real speech!
-    # Instead, we strip the exact front padding, and take EXACTLY the mathematical duration we need.
+    # Strip padding correctly
+    # We padded front by t_pad_16k (which is at 16k SR)
+    # The output is at tgt_sr
+    t_pad_tgt_actual = int(t_pad_16k * tgt_sr / 16000)
     expected_len = int(np.round(len(audio_np) * tgt_sr / sr))
     
-    if len(result) > t_pad_tgt:
-        # Strip exact front padding, and grab only the guaranteed audio duration
-        start_idx = int(t_pad_tgt)
-        result = result[start_idx : start_idx + expected_len]
+    if len(result) > t_pad_tgt_actual:
+        result = result[t_pad_tgt_actual : t_pad_tgt_actual + expected_len]
         
-    # Strictly pad the deficit (if the model catastrophically failed) 
-    # instead of doing a trailing crop that deletes the middle of words
     if len(result) < expected_len:
         result = np.pad(result, (0, expected_len - len(result)))
 
@@ -449,12 +453,16 @@ def infer(audio_np, sr, model, model_info, f0_up_key=0, index=None, big_npy=None
         # CRITICAL FIX: Limit the maximum scale multiplier to 2.5x to prevent
         # near-silent background room noise from exploding into deafening roar spikes!
         scale = np.clip(scale, 0.0, 2.5) 
+
+        # EDGE REFINEMENT: If the input is extremely quiet (noise floor), 
+        # force the scale to 0 to prevent "breathing" artifacts.
+        scale[rms_in_interp < 0.005] = 0.0
         
         scale = scale * rms_mix_rate + (1.0 - rms_mix_rate)
         result = result * scale
         
-        # Apply scaling
-        result = result * scale
+        # Apply scaling (FIXED: removed double-scaling bug)
+        # result = result * scale
         
     # Trim padding and audio scaling
         

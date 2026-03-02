@@ -41,6 +41,9 @@ class VoiceChangerEngine:
         self.use_echo = False
         self.echo_delay = 200
         self.echo_decay = 0.4
+        
+        from effects import SoftGate
+        self.soft_gate = SoftGate(threshold=self.gate_threshold)
 
         self.worker_thread = None
         self.ai_worker_thread = None  # Dedicated AI inference thread
@@ -61,14 +64,24 @@ class VoiceChangerEngine:
         from effects import AnimeGirlVoice
         self.anime_voice = AnimeGirlVoice(sample_rate=self.sample_rate)
         self.ai_converter = None
+        
+        # New Feature: UVR Preprocessing
+        self.use_uvr = False
+        try:
+            from ai_engine.uvr_wrapper import UVRPreprocessor
+            self.uvr_preprocessor = UVRPreprocessor(sample_rate=self.sample_rate)
+        except ImportError:
+            self.uvr_preprocessor = None
+            
         # Decoupled AI pipeline queues:
-        # audio_queue -> [AI worker] -> ai_out_queue -> [output thread]
-        self.ai_in_queue = queue.Queue(maxsize=4)   # raw input chunks for inference
-        self.ai_out_queue_samples = []              # flat float32 sample output ring
+        self.ai_in_queue = queue.Queue(maxsize=4)
+        self.ai_out_ring = np.zeros(sample_rate * 2, dtype=np.float32) # 2s ring buffer
+        self.ai_out_read_ptr = 0
+        self.ai_out_write_ptr = 0
         self.ai_out_lock = threading.Lock()
+
         # 28800 (600ms) window, step 24000 (500ms) = 100ms true overlap context
         self.ai_buffer = StreamBuffer(target_size=28800, step_size=24000)
-        self._last_ai_overlap = None                # Holds the previous overlap for crossfading
         self._last_played_audio = np.array([], dtype=np.float32)
         self._starving_frames = 0
 
@@ -104,14 +117,14 @@ class VoiceChangerEngine:
         """Apply the selected voice transformation and DSP chain."""
         processed = block.copy()
         
-        # Apply static Pre-Gain to cleanly boost microphone levels without destroying dynamics
-        processed = processed * 3.0
-        processed = np.clip(processed, -1.0, 1.0)
+        # 0. Pre-processing: DC offset removal and Soft Limiter (replaces hard * 3.0)
+        from effects import dc_offset_remover, soft_limiter
+        processed = dc_offset_remover(processed)
+        processed = soft_limiter(processed, drive=2.5) # Increased drive for better presence
         
         # 1. Noise Gate (Early in chain)
         if self.use_noise_gate:
-            from effects import noise_gate
-            processed = noise_gate(processed, threshold=self.gate_threshold)
+            processed = self.soft_gate.process(processed)
 
         # 2. Main Pitch/AI Conversion
         if effect == "anime_girl":
@@ -133,27 +146,39 @@ class VoiceChangerEngine:
                 
                 # Stage 2: drain the output sample ring to fill this block
                 with self.ai_out_lock:
-                    avail = len(self.ai_out_queue_samples)
                     need = len(processed.flatten())
-                    if avail >= need:
-                        chunk = self.ai_out_queue_samples[:need]
-                        self.ai_out_queue_samples = self.ai_out_queue_samples[need:]
-                        processed = np.array(chunk, dtype=np.float32).reshape(-1, 1)
-                        # Update history
-                        hist_len = len(self._last_played_audio)
-                        if need >= hist_len:
-                            self._last_played_audio = processed[-hist_len:].flatten().copy()
+                    filled = (self.ai_out_write_ptr - self.ai_out_read_ptr) % len(self.ai_out_ring)
+                    
+                    # Log health periodically
+                    if not hasattr(self, '_health_counter'): self._health_counter = 0
+                    self._health_counter += 1
+                    if self._health_counter % 50 == 0:
+                        print(f"[Buffer Health] {filled} samples ({filled/self.sample_rate:.2f}s) available", file=sys.stderr)
+
+                    # Starvation Recovery: if we were starving, wait for a 200ms buffer before resuming to prevent stuttering
+                    min_resumption = int(self.sample_rate * 0.2)
+                    if self._starving_frames > 0 and filled < min_resumption:
+                        can_play = False
+                    else:
+                        can_play = filled >= need
+
+                    if can_play:
+                        # Extract from ring buffer
+                        end_ptr = (self.ai_out_read_ptr + need) % len(self.ai_out_ring)
+                        if end_ptr > self.ai_out_read_ptr:
+                            samples = self.ai_out_ring[self.ai_out_read_ptr:end_ptr]
                         else:
-                            self._last_played_audio = np.roll(self._last_played_audio, -need)
-                            self._last_played_audio[-need:] = processed.flatten()
+                            samples = np.concatenate([self.ai_out_ring[self.ai_out_read_ptr:], self.ai_out_ring[:end_ptr]])
+                        
+                        self.ai_out_read_ptr = end_ptr
+                        processed = samples.reshape(-1, 1)
+                        
+                        # Update history for starvation recovery
+                        self._last_played_audio = samples.copy()
                         self._starving_frames = 0
                     else:
                         # Starvation! CPU is slower than realtime.
-                        # Instead of a jarring chunk cutoff or a buzz loop, we do a soft fade to silence.
                         fallback = np.zeros_like(processed.flatten(), dtype=np.float32)
-                        
-                        # If we just started starving, apply a quick 10ms fade out to the very last played sample
-                        # to prevent a speaker pop
                         if self._starving_frames == 0 and len(self._last_played_audio) > 0:
                             fade_len = min(need, 480) # 10ms
                             last_val = self._last_played_audio[-1]
@@ -229,54 +254,103 @@ class VoiceChangerEngine:
 
     def _ai_inference_worker(self):
         """Dedicated background thread: pulls buffered frames, runs RVC inference."""
-        # 100ms overlap
-        xfade_samples = int(self.sample_rate * 0.10)
+        # Professional Overlap-Add setup
+        target_len = self.ai_buffer.target_size
+        step_len = self.ai_buffer.step_size
+        xfade_len = target_len - step_len # 100ms (4800 samples)
         
+        # Hann window for smooth crossfading
+        hann_window = np.hanning(xfade_len * 2)
+        fade_out_win = hann_window[xfade_len:]
+        fade_in_win = hann_window[:xfade_len]
+        
+        overlap_buffer = np.zeros(xfade_len, dtype=np.float32)
+        
+        def find_optimal_shift(prev_tail, current_head, search_range):
+            """SOLA: Find optimal phase alignment using cross-correlation."""
+            if len(prev_tail) < search_range or len(current_head) < search_range:
+                return 0
+            
+            # Simple autocorrelation
+            best_corr = -1
+            best_shift = 0
+            
+            # We search for the best shift that aligns the waveforms
+            # prev_tail is the 'reference'
+            # current_head is the 'sliding' part
+            # Reduced search range for real-time performance (e.g., 5ms @ 48k = 240 samples)
+            L = min(search_range, len(prev_tail) // 2)
+            for shift in range(L):
+                # Calculate correlation coefficient for the overlapping parts
+                # We can use a simpler 'mean absolute difference' for speed or dot product
+                corr = np.dot(prev_tail[:L], current_head[shift:shift+L])
+                if corr > best_corr:
+                    best_corr = corr
+                    best_shift = shift
+            return best_shift
+
         while not self.stop_event.is_set():
             try:
                 frame = self.ai_in_queue.get(timeout=0.3)
             except queue.Empty:
                 continue
             try:
+                if self.use_uvr and self.uvr_preprocessor is not None:
+                    frame = self.uvr_preprocessor.process(frame)
+                    
                 ai_output = self.ai_converter.convert(frame)
                 if ai_output is not None:
                     ai_flat = ai_output.flatten()
                     
-                    # Exact length expected based on ratios
-                    target_len = self.ai_buffer.target_size
-                    step_len = self.ai_buffer.step_size
-                    
-                    # Ensure we have enough audio for OLA
                     if len(ai_flat) >= target_len:
-                        
-                        # The newly generated chunk (e.g. 600ms)
                         new_chunk = ai_flat[-target_len:].copy()
                         
-                        # 1. Crossfade the FIRST 100ms with the saved overlap from the PREVIOUS chunk
-                        if self._last_ai_overlap is not None and len(self._last_ai_overlap) == xfade_samples:
-                            fade_in = np.linspace(0, 1, xfade_samples, dtype=np.float32)
-                            fade_out = np.linspace(1, 0, xfade_samples, dtype=np.float32)
-                            new_chunk[:xfade_samples] = (new_chunk[:xfade_samples] * fade_in) + (self._last_ai_overlap * fade_out)
+                        # 1. SOLA Alignment
+                        # We use a search range of 10ms (480 samples) to find the best phase match
+                        shift = find_optimal_shift(overlap_buffer, new_chunk, 480)
+                        
+                        # 2. Synchronized Overlap-Add
+                        # Blend the shifted new chunk with the previous tail
+                        target_region = new_chunk[shift : shift + xfade_len]
+                        target_region[:] = (target_region * fade_in_win) + (overlap_buffer * fade_out_win)
+                        
+                        # 3. Extract the 'step' we want to play, starting from the aligned head
+                        payload = new_chunk[shift : shift + step_len].copy()
+                        
+                        # 4. Store the tail for the NEXT iteration's head
+                        overlap_buffer = new_chunk[shift + step_len : shift + step_len + xfade_len].copy()
+                        
+                        # If we ran out of buffer in new_chunk, pad overlap_buffer
+                        if len(overlap_buffer) < xfade_len:
+                            overlap_buffer = np.pad(overlap_buffer, (0, xfade_len - len(overlap_buffer)))
+                        
+                        # Push to Ring Buffer using fast numpy slices
+                        with self.ai_out_lock:
+                            n = len(payload)
+                            ring_len = len(self.ai_out_ring)
+                            end_ptr = (self.ai_out_write_ptr + n) % ring_len
                             
-                        # 2. Extract the payload we actually want to play (the 500ms step)
-                        # This includes the crossfaded part, plus the middle part
-                        play_chunk = new_chunk[:step_len].copy()
-                        
-                        # 3. Save the LAST 100ms as the overlap for the NEXT chunk
-                        self._last_ai_overlap = new_chunk[step_len:target_len].copy()
-                        
-                        samples = play_chunk.tolist()
+                            if end_ptr > self.ai_out_write_ptr:
+                                self.ai_out_ring[self.ai_out_write_ptr:end_ptr] = payload
+                            else:
+                                first_part = ring_len - self.ai_out_write_ptr
+                                self.ai_out_ring[self.ai_out_write_ptr:] = payload[:first_part]
+                                self.ai_out_ring[:end_ptr] = payload[first_part:]
+                            
+                            self.ai_out_write_ptr = end_ptr
                     else:
-                        # Fallback if array size is weird (shouldn't happen with strict streaming)
-                        samples = ai_flat.tolist()
-                        self._last_ai_overlap = None
-                    
-                    with self.ai_out_lock:
-                        self.ai_out_queue_samples.extend(samples)
-                        # Prevent unbounded growth: cap to ~2s of audio
-                        cap = self.sample_rate * 2
-                        if len(self.ai_out_queue_samples) > cap:
-                            self.ai_out_queue_samples = self.ai_out_queue_samples[-cap:]
+                        # Fallback for weird sizes
+                        with self.ai_out_lock:
+                            n = len(ai_flat)
+                            ring_len = len(self.ai_out_ring)
+                            end_ptr = (self.ai_out_write_ptr + n) % ring_len
+                            if end_ptr > self.ai_out_write_ptr:
+                                self.ai_out_ring[self.ai_out_write_ptr:end_ptr] = ai_flat
+                            else:
+                                first_part = ring_len - self.ai_out_write_ptr
+                                self.ai_out_ring[self.ai_out_write_ptr:] = ai_flat[:first_part]
+                                self.ai_out_ring[:end_ptr] = ai_flat[first_part:]
+                            self.ai_out_write_ptr = end_ptr
             except Exception as e:
                 import traceback
                 traceback.print_exc()
@@ -291,9 +365,10 @@ class VoiceChangerEngine:
         self.audio_queue = queue.Queue()
         self.ai_in_queue = queue.Queue(maxsize=4)
         with self.ai_out_lock:
-            self.ai_out_queue_samples = []
+            self.ai_out_ring.fill(0)
+            self.ai_out_read_ptr = 0
+            self.ai_out_write_ptr = 0
         self.ai_buffer.clear()
-        self._last_ai_overlap = None
 
         # Start AI inference worker first (so output thread always has a consumer)
         if effect == "ai":

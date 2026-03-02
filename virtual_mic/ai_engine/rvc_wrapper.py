@@ -68,7 +68,9 @@ class RVCVoiceConverter:
                 self.info, 
                 f0_up_key=self.pitch, 
                 index=self.index, 
-                big_npy=self.big_npy
+                big_npy=self.big_npy,
+                index_rate=0.85,  # Higher index rate for better model adherence
+                rms_mix_rate=0.3  # Better volume envelope matching
             )
             
             # The original implementation of rvc_infer.py might return (audio, sr) based on the error.

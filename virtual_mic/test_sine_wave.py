@@ -11,14 +11,22 @@ def test_pipeline():
     print("Initializing pipeline diagnostic...")
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
     from ai_engine import rvc_wrapper
+    from ai_engine import uvr_wrapper
     
-    model_path = r"models\EarthshakerRVC\EarthshakerRVC.pth"
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    model_path = os.path.join(base_dir, "models", "EarthshakerRVC", "EarthshakerRVC.pth")
     if not os.path.exists(model_path):
         print(f"Model not found: {model_path}")
         return
         
     converter = rvc_wrapper.RVCVoiceConverter(model_path, sample_rate=48000)
     converter.pitch = 0 # No pitch shift, keep it pure 
+
+    # Boot the UVR engine and wait for it to load into RAM
+    uvr = uvr_wrapper.UVRPreprocessor(sample_rate=48000)
+    print("Waiting for UVR model to initialize...")
+    while not uvr.is_ready:
+        time.sleep(0.5)
 
     # Generate strictly 1.8 seconds of pure 440Hz tone (exactly 3 chunks of 600ms)
     # 1.8s * 48000 = 86400 samples
@@ -36,11 +44,19 @@ def test_pipeline():
         end = start + chunk_size
         chunk = test_signal[start:end]
         
+        print(f"--- Processing Chunk {i+1} ---")
         t0 = time.time()
+        # 1. Run UVR VR Architecture Denoise (BYPASSING FOR FASTER SOLA TEST)
+        # chunk = uvr.process(chunk.reshape(-1, 1)).flatten()
+        chunk = chunk.flatten()
+        
+        # 2. Run RVC inference
+        print(f"Chunk {i+1}: running RVC...")
         out_chunk = converter.convert(chunk)
         t1 = time.time()
         
         proc_time = t1 - t0
+        print(f"Chunk {i+1} done in {proc_time:.2f}s")
         
         with open("sine_diagnostic.txt", "a", encoding="utf-8") as clog:
             if out_chunk is None:

@@ -73,8 +73,29 @@ class AnimeGirlVoice:
             traceback.print_exc()
             return audio_block
 
+class SoftGate:
+    """Noise gate with smoothed attack and release to prevent local pops/clicks."""
+    def __init__(self, threshold=0.01, attack_ms=10, release_ms=100, sample_rate=48000):
+        self.threshold = threshold
+        self.attack_coef = 1.0 - np.exp(-1.0 / (attack_ms * 0.001 * sample_rate))
+        self.release_coef = 1.0 - np.exp(-1.0 / (release_ms * 0.001 * sample_rate))
+        self.gain = 0.0
+
+    def process(self, audio_block):
+        if np is None: return audio_block
+        abs_max = np.max(np.abs(audio_block))
+        target_gain = 1.0 if abs_max > self.threshold else 0.0
+        
+        # Simple one-pole smoothing across the block
+        if target_gain > self.gain:
+            self.gain += self.attack_coef * (target_gain - self.gain)
+        else:
+            self.gain += self.release_coef * (target_gain - self.gain)
+            
+        return audio_block * self.gain
+
 def noise_gate(audio_block, threshold=0.01):
-    """Noise gate to remove background hiss without causing clipping distortion."""
+    """Legacy functional wrapper for simple gating."""
     if np is None: return audio_block
     if np.max(np.abs(audio_block)) < threshold:
         return np.zeros_like(audio_block)
@@ -90,3 +111,14 @@ def pitch_shift(audio_block, semitones, sample_rate=48000):
     if Pedalboard is None: return audio_block
     shift = PitchShift(semitones=semitones)
     return shift(audio_block.T, sample_rate).T
+
+def soft_limiter(audio_block, drive=1.0):
+    """Simple tanh-based soft limiter to prevent digital clipping while boosting volume."""
+    if np is None: return audio_block
+    # tanh(x) saturates smoothly at +/- 1.0
+    return np.tanh(audio_block * drive)
+
+def dc_offset_remover(audio_block):
+    """Removes DC offset (0 Hz component) from the signal to prevent pops and clicks."""
+    if np is None: return audio_block
+    return audio_block - np.mean(audio_block)
